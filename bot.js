@@ -4,81 +4,112 @@ const app = express();
 app.use(express.json());
 
 const SERVER = process.env.SERVER_IP || 'donutsmp.net';
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 let accounts = [];
 let bots = new Map();
 
-function decodeToken(token) {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
-    const profile = payload.pfd?.[0];
-    return {
-        username: profile.name,
-        uuid: profile.id
-    };
+function decodeJWT(token) {
+    try {
+        const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+        const profile = payload.pfd?.[0];
+        if (!profile) throw new Error('No profile in token');
+        
+        return {
+            username: profile.name,
+            uuid: profile.id.replace(/-/g, ''),
+            accessToken: token
+        };
+    } catch (err) {
+        console.error('Token decode failed:', err.message);
+        return null;
+    }
 }
 
 function startBot(account) {
+    const info = decodeJWT(account.token);
+    if (!info) {
+        console.error('Invalid token for account');
+        return;
+    }
+    
+    console.log(`Starting bot: ${info.username}`);
+    account.username = info.username;
+    
     try {
-        const info = decodeToken(account.token);
-        
         const bot = mineflayer.createBot({
             host: SERVER,
             port: 25565,
             username: info.username,
-            session: {
-                accessToken: account.token,
-                selectedProfile: {
-                    name: info.username,
-                    id: info.uuid
-                }
-            },
-            auth: 'offline', // Try offline first since we have token
-            skipValidation: true
+            auth: 'offline', // Try offline mode - server might allow it
+            version: false, // Auto-detect version
         });
         
         account.online = false;
-        account.username = info.username;
         
         bot.on('error', (err) => {
-            console.log(`[${info.username}] Error:`, err.message);
+            console.error(`[${info.username}] Error: ${err.message}`);
         });
         
-        bot.on('end', () => {
-            console.log(`[${info.username}] Disconnected`);
+        bot.on('kicked', (reason) => {
+            console.error(`[${info.username}] Kicked: ${reason}`);
+            account.online = false;
+        });
+        
+        bot.on('end', (reason) => {
+            console.log(`[${info.username}] Disconnected: ${reason}`);
             account.online = false;
             bots.delete(info.username);
         });
         
+        bot.on('login', () => {
+            console.log(`[${info.username}] Logged in!`);
+        });
+        
         bot.on('spawn', () => {
-            console.log(`[${info.username}] Spawned!`);
+            console.log(`[${info.username}] Spawned in game!`);
             account.online = true;
             
+            // AUTO MESSAGE SYSTEM
             const queue = [];
             const cooldown = new Set();
             let lastSend = 0;
             
             bot.on('message', (msg) => {
                 const text = msg.toString();
+                console.log(`[${info.username}] Chat: ${text}`);
+                
                 if (text.includes('[AutoMsg]') || text.includes('discord.gg')) return;
                 
                 const name = parseName(text, bot.username);
                 if (name && !cooldown.has(name) && !queue.includes(name)) {
                     queue.push(name);
+                    console.log(`[${info.username}] Queued: ${name} (Total: ${queue.length})`);
                 }
             });
             
-            setInterval(() => {
+            // Send messages every 2 seconds
+            const msgInterval = setInterval(() => {
+                if (!bot._client) {
+                    clearInterval(msgInterval);
+                    return;
+                }
+                
                 const now = Date.now();
                 if (now - lastSend >= 2000 && queue.length > 0) {
                     const target = queue.shift();
                     const random = Math.random().toString(36).substring(7);
                     
-                    bot.chat(`/msg ${target} discord.gg\\bills cheapest market ${random}`);
-                    
-                    lastSend = now;
-                    cooldown.add(target);
-                    setTimeout(() => cooldown.delete(target), 5000);
+                    try {
+                        bot.chat(`/msg ${target} discord.gg\\bills cheapest market ${random}`);
+                        console.log(`[${info.username}] ✉️  Sent to: ${target}`);
+                        
+                        lastSend = now;
+                        cooldown.add(target);
+                        setTimeout(() => cooldown.delete(target), 5000);
+                    } catch (err) {
+                        console.error(`[${info.username}] Failed to send: ${err.message}`);
+                    }
                 }
             }, 100);
         });
@@ -86,7 +117,9 @@ function startBot(account) {
         bots.set(info.username, bot);
         
     } catch (err) {
-        console.error(`Bot start failed:`, err.message);
+        console.error(`[${info.username}] Start failed: ${err.message}`);
+        console.error(err.stack);
+        account.online = false;
     }
 }
 
@@ -99,29 +132,50 @@ function parseName(text, myName) {
     return name;
 }
 
+// === API ENDPOINTS ===
+
+app.get('/', (req, res) => {
+    res.json({ status: 'running', bots: accounts.length });
+});
+
 app.get('/status', (req, res) => {
-    const online = Array.from(bots.values()).filter(b => b._client).length;
+    const online = Array.from(bots.values()).filter(b => b._client && b._client.socket).length;
     res.json({ total: accounts.length, online });
 });
 
 app.post('/add', (req, res) => {
-    const { token } = req.body;
-    const acc = { token, online: false };
-    accounts.push(acc);
-    startBot(acc);
-    res.json({ success: true });
+    try {
+        const { token } = req.body;
+        if (!token) return res.status(400).json({ error: 'Token required' });
+        
+        const info = decodeJWT(token);
+        if (!info) return res.status(400).json({ error: 'Invalid token' });
+        
+        const acc = { token, username: info.username, online: false };
+        accounts.push(acc);
+        
+        startBot(acc);
+        res.json({ username: info.username, status: 'starting' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/startall', (req, res) => {
+    let started = 0;
     accounts.forEach(a => {
-        if (!bots.has(a.username)) startBot(a);
+        if (!bots.has(a.username)) {
+            startBot(a);
+            started++;
+        }
     });
-    res.json({ success: true });
+    res.json({ success: true, started });
 });
 
 app.post('/stopall', (req, res) => {
     bots.forEach(bot => bot.end());
     bots.clear();
+    accounts.forEach(a => a.online = false);
     res.json({ success: true });
 });
 
@@ -129,4 +183,14 @@ app.get('/list', (req, res) => {
     res.json({ accounts });
 });
 
-app.listen(PORT, () => console.log(`Running on ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`🤖 Bot manager running on port ${PORT}`);
+    console.log(`📡 Will connect to: ${SERVER}:25565`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('Shutting down gracefully...');
+    bots.forEach(bot => bot.end());
+    process.exit(0);
+});
