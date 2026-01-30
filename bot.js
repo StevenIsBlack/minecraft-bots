@@ -9,6 +9,7 @@ const PORT = process.env.PORT || 8080;
 let accounts = [];
 let bots = new Map();
 
+// Decode JWT to get profile info
 function decodeJWT(token) {
     try {
         const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
@@ -17,7 +18,7 @@ function decodeJWT(token) {
         
         return {
             username: profile.name,
-            uuid: profile.id.replace(/-/g, ''),
+            uuid: profile.id,
             accessToken: token
         };
     } catch (err) {
@@ -26,10 +27,10 @@ function decodeJWT(token) {
     }
 }
 
-function startBot(account) {
+async function startBot(account) {
     const info = decodeJWT(account.token);
     if (!info) {
-        console.error('Invalid token for account');
+        console.error('Invalid token');
         return;
     }
     
@@ -37,12 +38,23 @@ function startBot(account) {
     account.username = info.username;
     
     try {
+        // Create bot with direct token injection (like the mod does)
         const bot = mineflayer.createBot({
             host: SERVER,
             port: 25565,
             username: info.username,
-            auth: 'offline', // Try offline mode - server might allow it
-            version: false, // Auto-detect version
+            auth: 'microsoft',
+            // Directly provide the session - bypass auth flow
+            session: {
+                accessToken: info.accessToken,
+                clientToken: generateClientToken(),
+                selectedProfile: {
+                    name: info.username,
+                    id: info.uuid
+                }
+            },
+            skipValidation: true, // Don't validate the token with Mojang
+            version: false,
         });
         
         account.online = false;
@@ -63,34 +75,30 @@ function startBot(account) {
         });
         
         bot.on('login', () => {
-            console.log(`[${info.username}] Logged in!`);
+            console.log(`[${info.username}] ✅ Logged in!`);
         });
         
         bot.on('spawn', () => {
-            console.log(`[${info.username}] Spawned in game!`);
+            console.log(`[${info.username}] 🎮 Spawned!`);
             account.online = true;
             
-            // AUTO MESSAGE SYSTEM
             const queue = [];
             const cooldown = new Set();
             let lastSend = 0;
             
             bot.on('message', (msg) => {
                 const text = msg.toString();
-                console.log(`[${info.username}] Chat: ${text}`);
-                
                 if (text.includes('[AutoMsg]') || text.includes('discord.gg')) return;
                 
                 const name = parseName(text, bot.username);
                 if (name && !cooldown.has(name) && !queue.includes(name)) {
                     queue.push(name);
-                    console.log(`[${info.username}] Queued: ${name} (Total: ${queue.length})`);
+                    console.log(`[${info.username}] 📥 Queued: ${name} (Queue: ${queue.length})`);
                 }
             });
             
-            // Send messages every 2 seconds
             const msgInterval = setInterval(() => {
-                if (!bot._client) {
+                if (!bot._client || !bot._client.socket) {
                     clearInterval(msgInterval);
                     return;
                 }
@@ -102,13 +110,13 @@ function startBot(account) {
                     
                     try {
                         bot.chat(`/msg ${target} discord.gg\\bills cheapest market ${random}`);
-                        console.log(`[${info.username}] ✉️  Sent to: ${target}`);
+                        console.log(`[${info.username}] 📨 Sent to: ${target} (Queue: ${queue.length})`);
                         
                         lastSend = now;
                         cooldown.add(target);
                         setTimeout(() => cooldown.delete(target), 5000);
                     } catch (err) {
-                        console.error(`[${info.username}] Failed to send: ${err.message}`);
+                        console.error(`[${info.username}] Send failed: ${err.message}`);
                     }
                 }
             }, 100);
@@ -117,10 +125,19 @@ function startBot(account) {
         bots.set(info.username, bot);
         
     } catch (err) {
-        console.error(`[${info.username}] Start failed: ${err.message}`);
+        console.error(`[${info.username}] Failed: ${err.message}`);
         console.error(err.stack);
         account.online = false;
     }
+}
+
+// Generate a random client token (like launchers do)
+function generateClientToken() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+    });
 }
 
 function parseName(text, myName) {
@@ -132,14 +149,14 @@ function parseName(text, myName) {
     return name;
 }
 
-// === API ENDPOINTS ===
+// === API ===
 
 app.get('/', (req, res) => {
     res.json({ status: 'running', bots: accounts.length });
 });
 
 app.get('/status', (req, res) => {
-    const online = Array.from(bots.values()).filter(b => b._client && b._client.socket).length;
+    const online = accounts.filter(a => a.online).length;
     res.json({ total: accounts.length, online });
 });
 
@@ -164,7 +181,7 @@ app.post('/add', (req, res) => {
 app.post('/startall', (req, res) => {
     let started = 0;
     accounts.forEach(a => {
-        if (!bots.has(a.username)) {
+        if (!a.online) {
             startBot(a);
             started++;
         }
@@ -180,7 +197,11 @@ app.post('/stopall', (req, res) => {
 });
 
 app.get('/list', (req, res) => {
-    res.json({ accounts });
+    const list = accounts.map(a => ({
+        username: a.username,
+        online: a.online
+    }));
+    res.json({ accounts: list });
 });
 
 app.listen(PORT, () => {
@@ -188,9 +209,8 @@ app.listen(PORT, () => {
     console.log(`📡 Will connect to: ${SERVER}:25565`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-    console.log('Shutting down gracefully...');
+    console.log('Shutting down...');
     bots.forEach(bot => bot.end());
     process.exit(0);
 });
