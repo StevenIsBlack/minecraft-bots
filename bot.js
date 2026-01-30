@@ -9,55 +9,65 @@ const PORT = process.env.PORT || 3000;
 let accounts = [];
 let bots = new Map();
 
-// Your AutoMsg logic
+function decodeToken(token) {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+    const profile = payload.pfd?.[0];
+    return {
+        username: profile.name,
+        uuid: profile.id
+    };
+}
+
 function startBot(account) {
     try {
+        const info = decodeToken(account.token);
+        
         const bot = mineflayer.createBot({
             host: SERVER,
             port: 25565,
-            username: account.username,
-            auth: 'microsoft',
+            username: info.username,
             session: {
                 accessToken: account.token,
-                clientToken: 'client-token',
                 selectedProfile: {
-                    name: account.username,
-                    id: 'uuid-here'
+                    name: info.username,
+                    id: info.uuid
                 }
-            }
+            },
+            auth: 'offline', // Try offline first since we have token
+            skipValidation: true
         });
         
         account.online = false;
+        account.username = info.username;
         
-        bot.on('error', (err) => console.log(`[${account.username}] Error:`, err.message));
+        bot.on('error', (err) => {
+            console.log(`[${info.username}] Error:`, err.message);
+        });
         
         bot.on('end', () => {
-            console.log(`[${account.username}] Disconnected, reconnecting in 5s...`);
+            console.log(`[${info.username}] Disconnected`);
             account.online = false;
-            bots.delete(account.username);
-            setTimeout(() => startBot(account), 5000);
+            bots.delete(info.username);
         });
         
         bot.on('spawn', () => {
-            console.log(`[${account.username}] Spawned!`);
+            console.log(`[${info.username}] Spawned!`);
             account.online = true;
             
-            // AUTO MESSAGE SYSTEM (Your code!)
             const queue = [];
             const cooldown = new Set();
             let lastSend = 0;
             
             bot.on('message', (msg) => {
                 const text = msg.toString();
-                if (text.includes('[AutoMsg]')) return;
+                if (text.includes('[AutoMsg]') || text.includes('discord.gg')) return;
                 
-                const name = parseName(text, account.username);
+                const name = parseName(text, bot.username);
                 if (name && !cooldown.has(name) && !queue.includes(name)) {
                     queue.push(name);
                 }
             });
             
-            // Send every 2 seconds
             setInterval(() => {
                 const now = Date.now();
                 if (now - lastSend >= 2000 && queue.length > 0) {
@@ -73,11 +83,10 @@ function startBot(account) {
             }, 100);
         });
         
-        bots.set(account.username, bot);
+        bots.set(info.username, bot);
         
     } catch (err) {
-        console.error(`[${account.username}] Failed:`, err.message);
-        account.online = false;
+        console.error(`Bot start failed:`, err.message);
     }
 }
 
@@ -90,21 +99,17 @@ function parseName(text, myName) {
     return name;
 }
 
-// API
 app.get('/status', (req, res) => {
     const online = Array.from(bots.values()).filter(b => b._client).length;
     res.json({ total: accounts.length, online });
 });
 
 app.post('/add', (req, res) => {
-    const { token, username } = req.body;
-    const name = username || 'Bot' + accounts.length;
-    
-    const acc = { username: name, token, online: false };
+    const { token } = req.body;
+    const acc = { token, online: false };
     accounts.push(acc);
-    
     startBot(acc);
-    res.json({ username: name });
+    res.json({ success: true });
 });
 
 app.post('/startall', (req, res) => {
@@ -117,7 +122,6 @@ app.post('/startall', (req, res) => {
 app.post('/stopall', (req, res) => {
     bots.forEach(bot => bot.end());
     bots.clear();
-    accounts.forEach(a => a.online = false);
     res.json({ success: true });
 });
 
@@ -125,6 +129,4 @@ app.get('/list', (req, res) => {
     res.json({ accounts });
 });
 
-app.listen(PORT, () => {
-    console.log(`Bot manager running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Running on ${PORT}`));
