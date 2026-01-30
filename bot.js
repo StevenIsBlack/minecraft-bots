@@ -1,5 +1,7 @@
 const mineflayer = require('mineflayer');
+const { Authflow, Titles } = require('prismarine-auth');
 const express = require('express');
+const fs = require('fs');
 const app = express();
 app.use(express.json());
 
@@ -9,55 +11,75 @@ const PORT = process.env.PORT || 8080;
 let accounts = [];
 let bots = new Map();
 
-function decodeJWT(token) {
-    try {
-        const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
-        const profile = payload.pfd?.[0];
-        return {
-            username: profile.name,
-            uuid: profile.id,
-            token: token
-        };
-    } catch (err) {
+// Parse the email:password:token format
+function parseCredentials(input) {
+    const parts = input.split(':');
+    if (parts.length < 3) {
         return null;
+    }
+    
+    return {
+        email: parts[0],
+        password: parts[1],
+        token: parts.slice(2).join(':') // In case password has colons
+    };
+}
+
+// Custom authflow that uses the token to bypass 2FA
+class TokenAuthflow extends Authflow {
+    constructor(username, cacheDir, token) {
+        super(username, cacheDir, {
+            authTitle: Titles.MinecraftJava,
+            flow: 'live',
+        });
+        this.xboxToken = token;
+    }
+    
+    // Override to use our existing Xbox token
+    async getXboxToken() {
+        console.log('Using provided Xbox token instead of interactive login');
+        
+        // Decode the token to get user hash
+        try {
+            const payload = JSON.parse(Buffer.from(this.xboxToken.split('.')[1], 'base64').toString());
+            return {
+                userHash: payload.xuid,
+                XSTSToken: this.xboxToken,
+                expiresOn: payload.exp * 1000
+            };
+        } catch (err) {
+            console.error('Failed to use token, falling back to normal auth');
+            return await super.getXboxToken();
+        }
     }
 }
 
 async function startBot(account) {
-    const info = decodeJWT(account.token);
-    if (!info) {
-        console.error('Invalid token');
+    const creds = parseCredentials(account.credentials);
+    if (!creds) {
+        console.error('Invalid credentials format');
         return;
     }
     
-    console.log(`Starting bot: ${info.username}`);
-    account.username = info.username;
+    console.log(`Starting bot with email: ${creds.email}`);
     
     try {
-        // Try using mineflayer with manual session injection
+        // Create cache directory
+        if (!fs.existsSync('./auth_cache')) {
+            fs.mkdirSync('./auth_cache', { recursive: true });
+        }
+        
+        // Use custom authflow with token
+        const authflow = new TokenAuthflow(creds.email, './auth_cache', creds.token);
+        
         const bot = mineflayer.createBot({
             host: SERVER,
             port: 25565,
-            username: info.username,
-            // Provide the session directly - bypass all auth
-            accessToken: account.token,
-            clientToken: info.uuid,
-            // Critical: tell mineflayer to skip validation
-            skipValidation: true,
             auth: 'microsoft',
+            authflow: authflow,
             profilesFolder: './auth_cache',
             version: false,
         });
-        
-        // Force override the session BEFORE connection
-        bot.session = {
-            accessToken: account.token,
-            clientToken: info.uuid,
-            selectedProfile: {
-                id: info.uuid,
-                name: info.username
-            }
-        };
         
         account.online = false;
         const queue = [];
@@ -65,37 +87,39 @@ async function startBot(account) {
         let lastSend = 0;
         
         bot.on('error', (err) => {
-            console.error(`[${info.username}] Error: ${err.message}`);
+            console.error(`[${creds.email}] Error: ${err.message}`);
         });
         
         bot.on('kicked', (reason) => {
-            console.error(`[${info.username}] Kicked: ${reason}`);
+            console.error(`[${creds.email}] Kicked: ${reason}`);
             account.online = false;
         });
         
         bot.on('end', () => {
-            console.log(`[${info.username}] Disconnected`);
+            console.log(`[${creds.email}] Disconnected`);
             account.online = false;
-            bots.delete(info.username);
+            if (account.username) {
+                bots.delete(account.username);
+            }
         });
         
         bot.on('login', () => {
-            console.log(`[${info.username}] ✅ Logged in!`);
+            console.log(`[${bot.username}] ✅ Logged in!`);
+            account.username = bot.username;
             account.online = true;
         });
         
         bot.on('spawn', () => {
-            console.log(`[${info.username}] 🎮 Spawned!`);
-            account.online = true;
+            console.log(`[${bot.username}] 🎮 Spawned!`);
         });
         
         bot.on('messagestr', (message) => {
             if (message.includes('discord.gg')) return;
             
-            const name = parseName(message, info.username);
+            const name = parseName(message, bot.username);
             if (name && !cooldown.has(name) && !queue.includes(name)) {
                 queue.push(name);
-                console.log(`[${info.username}] 📥 Queued: ${name}`);
+                console.log(`[${bot.username}] 📥 Queued: ${name}`);
             }
         });
         
@@ -109,21 +133,19 @@ async function startBot(account) {
                 
                 try {
                     bot.chat(`/msg ${target} discord.gg\\bills cheapest market ${random}`);
-                    console.log(`[${info.username}] 📨 Sent to: ${target}`);
+                    console.log(`[${bot.username}] 📨 Sent to: ${target}`);
                     
                     lastSend = now;
                     cooldown.add(target);
                     setTimeout(() => cooldown.delete(target), 5000);
-                } catch (err) {
-                    console.error(`Send failed`);
-                }
+                } catch (err) {}
             }
         }, 100);
         
-        bots.set(info.username, bot);
+        bots.set(creds.email, bot);
         
     } catch (err) {
-        console.error(`[${info.username}] Failed: ${err.message}`);
+        console.error(`Failed to start bot: ${err.message}`);
         account.online = false;
     }
 }
@@ -147,12 +169,17 @@ app.post('/add', async (req, res) => {
         const { token } = req.body;
         if (!token) return res.status(400).json({ error: 'Token required' });
         
-        const acc = { token, username: 'Loading...', online: false };
+        const creds = parseCredentials(token);
+        if (!creds) {
+            return res.status(400).json({ error: 'Invalid format. Use: email:password:token' });
+        }
+        
+        const acc = { credentials: token, username: 'Loading...', online: false };
         accounts.push(acc);
         
         startBot(acc);
         
-        res.json({ status: 'starting' });
+        res.json({ email: creds.email, status: 'starting' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -175,4 +202,5 @@ app.get('/list', (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`🤖 Bot manager running on port ${PORT}`);
+    console.log(`📡 Will connect to: ${SERVER}:25565`);
 });
