@@ -1,4 +1,4 @@
-const mineflayer = require('mineflayer');
+const mc = require('minecraft-protocol');
 const express = require('express');
 const app = express();
 app.use(express.json());
@@ -9,7 +9,6 @@ const PORT = process.env.PORT || 8080;
 let accounts = [];
 let bots = new Map();
 
-// Decode JWT to get profile info
 function decodeJWT(token) {
     try {
         const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
@@ -18,7 +17,7 @@ function decodeJWT(token) {
         
         return {
             username: profile.name,
-            uuid: profile.id,
+            uuid: profile.id.replace(/-/g, ''),
             accessToken: token
         };
     } catch (err) {
@@ -38,106 +37,95 @@ async function startBot(account) {
     account.username = info.username;
     
     try {
-        // Create bot with direct token injection (like the mod does)
-        const bot = mineflayer.createBot({
+        const client = mc.createClient({
             host: SERVER,
             port: 25565,
             username: info.username,
             auth: 'microsoft',
-            // Directly provide the session - bypass auth flow
             session: {
                 accessToken: info.accessToken,
-                clientToken: generateClientToken(),
+                clientToken: info.uuid,
                 selectedProfile: {
-                    name: info.username,
-                    id: info.uuid
+                    id: info.uuid,
+                    name: info.username
                 }
             },
-            skipValidation: true, // Don't validate the token with Mojang
+            skipValidation: true,
             version: false,
         });
         
         account.online = false;
         
-        bot.on('error', (err) => {
+        const queue = [];
+        const cooldown = new Set();
+        let lastSend = 0;
+        
+        client.on('error', (err) => {
             console.error(`[${info.username}] Error: ${err.message}`);
         });
         
-        bot.on('kicked', (reason) => {
-            console.error(`[${info.username}] Kicked: ${reason}`);
+        client.on('kick_disconnect', (packet) => {
+            const reason = JSON.parse(packet.reason);
+            console.error(`[${info.username}] Kicked: ${JSON.stringify(reason)}`);
             account.online = false;
         });
         
-        bot.on('end', (reason) => {
-            console.log(`[${info.username}] Disconnected: ${reason}`);
+        client.on('end', () => {
+            console.log(`[${info.username}] Disconnected`);
             account.online = false;
             bots.delete(info.username);
         });
         
-        bot.on('login', () => {
+        client.on('login', () => {
             console.log(`[${info.username}] ✅ Logged in!`);
+            account.online = true;
         });
         
-        bot.on('spawn', () => {
-            console.log(`[${info.username}] 🎮 Spawned!`);
-            account.online = true;
-            
-            const queue = [];
-            const cooldown = new Set();
-            let lastSend = 0;
-            
-            bot.on('message', (msg) => {
-                const text = msg.toString();
+        client.on('chat', (packet) => {
+            try {
+                const msg = JSON.parse(packet.message);
+                const text = msg.text || msg.translate || '';
+                
                 if (text.includes('[AutoMsg]') || text.includes('discord.gg')) return;
                 
-                const name = parseName(text, bot.username);
+                const name = parseName(text, info.username);
                 if (name && !cooldown.has(name) && !queue.includes(name)) {
                     queue.push(name);
-                    console.log(`[${info.username}] 📥 Queued: ${name} (Queue: ${queue.length})`);
+                    console.log(`[${info.username}] 📥 Queued: ${name}`);
                 }
-            });
-            
-            const msgInterval = setInterval(() => {
-                if (!bot._client || !bot._client.socket) {
-                    clearInterval(msgInterval);
-                    return;
-                }
-                
-                const now = Date.now();
-                if (now - lastSend >= 2000 && queue.length > 0) {
-                    const target = queue.shift();
-                    const random = Math.random().toString(36).substring(7);
-                    
-                    try {
-                        bot.chat(`/msg ${target} discord.gg\\bills cheapest market ${random}`);
-                        console.log(`[${info.username}] 📨 Sent to: ${target} (Queue: ${queue.length})`);
-                        
-                        lastSend = now;
-                        cooldown.add(target);
-                        setTimeout(() => cooldown.delete(target), 5000);
-                    } catch (err) {
-                        console.error(`[${info.username}] Send failed: ${err.message}`);
-                    }
-                }
-            }, 100);
+            } catch (e) {}
         });
         
-        bots.set(info.username, bot);
+        setInterval(() => {
+            if (!client.socket || !client.socket.writable) return;
+            
+            const now = Date.now();
+            if (now - lastSend >= 2000 && queue.length > 0) {
+                const target = queue.shift();
+                const random = Math.random().toString(36).substring(7);
+                
+                try {
+                    client.write('chat', {
+                        message: `/msg ${target} discord.gg\\bills cheapest market ${random}`
+                    });
+                    console.log(`[${info.username}] 📨 Sent to: ${target}`);
+                    
+                    lastSend = now;
+                    cooldown.add(target);
+                    setTimeout(() => cooldown.delete(target), 5000);
+                } catch (err) {
+                    console.error(`[${info.username}] Send failed: ${err.message}`);
+                }
+            }
+        }, 100);
+        
+        bots.set(info.username, client);
         
     } catch (err) {
         console.error(`[${info.username}] Failed: ${err.message}`);
         console.error(err.stack);
         account.online = false;
     }
-}
-
-// Generate a random client token (like launchers do)
-function generateClientToken() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-        const r = Math.random() * 16 | 0;
-        const v = c === 'x' ? r : (r & 0x3 | 0x8);
-        return v.toString(16);
-    });
 }
 
 function parseName(text, myName) {
@@ -148,8 +136,6 @@ function parseName(text, myName) {
     if (name === myName || name.length < 3) return null;
     return name;
 }
-
-// === API ===
 
 app.get('/', (req, res) => {
     res.json({ status: 'running', bots: accounts.length });
@@ -190,7 +176,7 @@ app.post('/startall', (req, res) => {
 });
 
 app.post('/stopall', (req, res) => {
-    bots.forEach(bot => bot.end());
+    bots.forEach(client => client.end());
     bots.clear();
     accounts.forEach(a => a.online = false);
     res.json({ success: true });
@@ -211,6 +197,6 @@ app.listen(PORT, () => {
 
 process.on('SIGTERM', () => {
     console.log('Shutting down...');
-    bots.forEach(bot => bot.end());
+    bots.forEach(client => client.end());
     process.exit(0);
 });
