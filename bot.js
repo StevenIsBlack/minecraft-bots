@@ -9,28 +9,31 @@ const PORT = process.env.PORT || 8080;
 let accounts = [];
 let bots = new Map();
 
+console.log('=================================');
+console.log('Minecraft Bot Manager Starting...');
+console.log('Server:', SERVER);
+console.log('Port:', PORT);
+console.log('=================================');
+
 function parseCredentials(input) {
     const parts = input.split(':');
     if (parts.length < 3) return null;
-    
-    const email = parts[0];
-    const password = parts[1];
-    const token = parts.slice(2).join(':');
-    
-    return { email, password, token };
+    return { 
+        email: parts[0], 
+        password: parts[1], 
+        token: parts.slice(2).join(':') 
+    };
 }
 
 function decodeJWT(token) {
     try {
         const parts = token.split('.');
         if (parts.length < 2) return null;
-        
         const payload = JSON.parse(Buffer.from(parts[1], 'base64'));
         const profile = payload.pfd?.[0];
-        
         return { 
-            username: profile?.name || 'Unknown', 
-            uuid: profile?.id || 'unknown-uuid'
+            username: profile?.name || 'Bot' + Date.now(), 
+            uuid: profile?.id || 'uuid'
         };
     } catch (e) {
         console.error('JWT decode error:', e.message);
@@ -42,7 +45,7 @@ async function startBot(account) {
     try {
         const creds = parseCredentials(account.credentials);
         if (!creds) {
-            console.error('Invalid credentials format');
+            console.error('Invalid credentials');
             return;
         }
         
@@ -52,7 +55,7 @@ async function startBot(account) {
             return;
         }
         
-        console.log(`Starting: ${info.username}`);
+        console.log(`[${info.username}] Starting bot...`);
         account.username = info.username;
         account.online = false;
         
@@ -63,13 +66,12 @@ async function startBot(account) {
             auth: 'microsoft',
             session: {
                 accessToken: creds.token,
-                clientToken: 'client-token',
+                clientToken: 'client',
                 selectedProfile: {
                     id: info.uuid,
                     name: info.username
                 }
-            },
-            version: false
+            }
         });
         
         const queue = [];
@@ -78,37 +80,17 @@ async function startBot(account) {
         
         client.on('error', (e) => {
             console.error(`[${info.username}] Error: ${e.message}`);
-            account.online = false;
-        });
-        
-        client.on('kick_disconnect', (packet) => {
-            try {
-                const reason = JSON.parse(packet.reason);
-                console.error(`[${info.username}] Kicked: ${reason.text || reason}`);
-            } catch {
-                console.error(`[${info.username}] Kicked: ${packet.reason}`);
-            }
-            account.online = false;
-            bots.delete(info.username);
-            
-            // Auto-reconnect after 10 seconds
-            setTimeout(() => {
-                console.log(`[${info.username}] Reconnecting...`);
-                startBot(account);
-            }, 10000);
         });
         
         client.on('end', () => {
-            console.log(`[${info.username}] Disconnected`);
+            console.log(`[${info.username}] Disconnected, reconnecting in 10s...`);
             account.online = false;
             bots.delete(info.username);
-            
-            // Auto-reconnect
             setTimeout(() => startBot(account), 10000);
         });
         
         client.on('login', () => {
-            console.log(`[${info.username}] ✅ LOGGED IN!`);
+            console.log(`[${info.username}] ✅ LOGGED IN`);
             account.online = true;
         });
         
@@ -119,174 +101,101 @@ async function startBot(account) {
                     : packet.message;
                 
                 text = extractText(text);
-                
-                if (!text || text.includes('discord.gg') || text.includes('[AutoMsg]')) {
-                    return;
-                }
+                if (!text || text.includes('discord.gg')) return;
                 
                 const name = parseName(text, info.username);
-                
                 if (name && !cooldown.has(name) && !queue.includes(name)) {
                     queue.push(name);
-                    console.log(`[${info.username}] Queued: ${name} (Total: ${queue.length})`);
                 }
-            } catch (e) {
-                // Ignore chat parse errors
-            }
+            } catch {}
         });
         
-        // Message sender - runs every 100ms
-        const sender = setInterval(() => {
-            if (!client.socket?.writable || !account.online) return;
-            
+        setInterval(() => {
+            if (!client.socket?.writable) return;
             const now = Date.now();
-            
-            // Send every 2 seconds
             if (now - lastSend >= 2000 && queue.length > 0) {
                 const target = queue.shift();
-                
                 try {
-                    const random = Math.random().toString(36).substring(7);
+                    const rand = Math.random().toString(36).substring(7);
                     client.write('chat', { 
-                        message: `/msg ${target} discord.gg\\bills cheapest market ${random}` 
+                        message: `/msg ${target} discord.gg\\bills cheapest market ${rand}` 
                     });
-                    
-                    console.log(`[${info.username}] ✓ Sent to: ${target}`);
-                    
                     lastSend = now;
                     cooldown.add(target);
-                    
-                    // Remove from cooldown after 5 seconds
                     setTimeout(() => cooldown.delete(target), 5000);
-                } catch (e) {
-                    console.error(`[${info.username}] Send error:`, e.message);
-                }
+                } catch {}
             }
         }, 100);
-        
-        client.on('end', () => clearInterval(sender));
         
         bots.set(info.username, client);
         
     } catch (error) {
-        console.error('startBot error:', error.message);
-        account.online = false;
+        console.error('startBot error:', error);
     }
 }
 
-function extractText(component) {
-    if (typeof component === 'string') return component;
-    if (!component) return '';
-    
-    let text = component.text || '';
-    
-    if (component.extra && Array.isArray(component.extra)) {
-        component.extra.forEach(extra => {
-            text += extractText(extra);
-        });
-    }
-    
+function extractText(c) {
+    if (typeof c === 'string') return c;
+    if (!c) return '';
+    let text = c.text || '';
+    if (c.extra) c.extra.forEach(e => text += extractText(e));
     return text;
 }
 
 function parseName(text, myName) {
-    if (!text || !text.includes(':')) return null;
-    
-    let name = text.split(':')[0].trim();
-    name = name.replace(/§./g, '').replace(/\[.*?\]/g, '').trim();
-    
-    if (name.endsWith('+')) {
-        name = name.slice(0, -1);
-    }
-    
-    if (!name || name === myName || name.length < 3 || name.length > 16) {
-        return null;
-    }
-    
-    return name;
+    if (!text?.includes(':')) return null;
+    let name = text.split(':')[0].trim().replace(/§./g, '').replace(/\[.*?\]/g, '').trim();
+    if (name.endsWith('+')) name = name.slice(0, -1);
+    return (name === myName || name.length < 3) ? null : name;
 }
 
-// API Routes
+// Routes
 app.get('/', (req, res) => {
-    res.json({ status: 'Bot manager running', bots: accounts.length });
+    console.log('GET / - Health check');
+    res.json({ status: 'running', accounts: accounts.length, online: accounts.filter(a => a.online).length });
 });
 
 app.get('/status', (req, res) => {
+    console.log('GET /status');
     const online = accounts.filter(a => a.online).length;
-    res.json({ 
-        total: accounts.length, 
-        online: online,
-        offline: accounts.length - online
-    });
+    res.json({ total: accounts.length, online: online, offline: accounts.length - online });
 });
 
 app.post('/add', (req, res) => {
-    const { token, username } = req.body;
+    console.log('POST /add');
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'Token required' });
     
-    if (!token) {
-        return res.status(400).json({ error: 'Token required' });
-    }
-    
-    const acc = { 
-        credentials: token, 
-        username: username || 'Loading...', 
-        online: false 
-    };
-    
+    const acc = { credentials: token, username: 'Loading...', online: false };
     accounts.push(acc);
-    
     startBot(acc);
     
-    res.json({ 
-        status: 'starting',
-        username: acc.username
-    });
+    res.json({ status: 'starting', username: acc.username });
 });
 
 app.post('/startall', (req, res) => {
-    accounts.forEach(acc => {
-        if (!bots.has(acc.username)) {
-            startBot(acc);
-        }
+    console.log('POST /startall');
+    accounts.forEach(a => {
+        if (!bots.has(a.username)) startBot(a);
     });
-    res.json({ success: true });
+    res.json({ success: true, message: 'Starting all bots' });
 });
 
 app.post('/stopall', (req, res) => {
-    bots.forEach(client => {
-        try {
-            client.end();
-        } catch (e) {}
-    });
+    console.log('POST /stopall');
+    bots.forEach(c => c.end());
     bots.clear();
     accounts.forEach(a => a.online = false);
-    res.json({ success: true });
+    res.json({ success: true, message: 'Stopped all bots' });
 });
 
 app.get('/list', (req, res) => {
-    res.json({ 
-        accounts: accounts.map(a => ({ 
-            username: a.username, 
-            online: a.online 
-        }))
-    });
+    console.log('GET /list');
+    res.json({ accounts: accounts.map(a => ({ username: a.username, online: a.online })) });
 });
 
-app.delete('/remove/:username', (req, res) => {
-    const username = req.params.username;
-    const bot = bots.get(username);
-    
-    if (bot) {
-        bot.end();
-        bots.delete(username);
-    }
-    
-    accounts = accounts.filter(a => a.username !== username);
-    
-    res.json({ success: true });
-});
-
-app.listen(PORT, () => {
-    console.log(`Bot manager running on port ${PORT}`);
-    console.log(`Server: ${SERVER}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log('=================================');
+    console.log(`✅ Bot Manager Running on Port ${PORT}`);
+    console.log('=================================');
 });
