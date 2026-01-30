@@ -1,5 +1,6 @@
 const mc = require('minecraft-protocol');
 const express = require('express');
+const axios = require('axios');
 const app = express();
 app.use(express.json());
 
@@ -18,11 +19,60 @@ function decodeJWT(token) {
         return {
             username: profile.name,
             uuid: profile.id,
+            xuid: payload.xuid,
             accessToken: token
         };
     } catch (err) {
         console.error('Token decode failed:', err.message);
         return null;
+    }
+}
+
+// Convert Xbox token to Minecraft token
+async function getMinecraftToken(xboxToken, xuid) {
+    try {
+        console.log('Converting Xbox token to Minecraft token...');
+        
+        // Step 1: Get XSTS token for Minecraft
+        const xstsResponse = await axios.post('https://xsts.auth.xboxlive.com/xsts/authorize', {
+            Properties: {
+                SandboxId: 'RETAIL',
+                UserTokens: [xboxToken]
+            },
+            RelyingParty: 'rp://api.minecraftservices.com/',
+            TokenType: 'JWT'
+        }, {
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        });
+        
+        const xstsToken = xstsResponse.data.Token;
+        const userHash = xstsResponse.data.DisplayClaims.xui[0].uhs;
+        
+        console.log('Got XSTS token, getting Minecraft token...');
+        
+        // Step 2: Get Minecraft access token
+        const mcResponse = await axios.post('https://api.minecraftservices.com/authentication/login_with_xbox', {
+            identityToken: `XBL3.0 x=${userHash};${xstsToken}`
+        }, {
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        });
+        
+        console.log('Got Minecraft access token!');
+        
+        return {
+            accessToken: mcResponse.data.access_token,
+            expiresIn: mcResponse.data.expires_in
+        };
+        
+    } catch (err) {
+        console.error('Token conversion failed:', err.response?.data || err.message);
+        throw err;
     }
 }
 
@@ -33,29 +83,38 @@ async function startBot(account) {
         return;
     }
     
-    console.log(`Starting bot: ${info.username} (UUID: ${info.uuid})`);
+    console.log(`Starting bot: ${info.username}`);
     account.username = info.username;
     
     try {
-        // Create client WITHOUT auth - we'll handle it manually
+        // Try to convert Xbox token to Minecraft token
+        let mcToken;
+        try {
+            const tokenData = await getMinecraftToken(info.accessToken, info.xuid);
+            mcToken = tokenData.accessToken;
+            console.log(`[${info.username}] Successfully converted token!`);
+        } catch (err) {
+            console.error(`[${info.username}] Token conversion failed, trying direct connection...`);
+            mcToken = info.accessToken; // Fallback to original token
+        }
+        
         const client = mc.createClient({
             host: SERVER,
             port: 25565,
             username: info.username,
-            auth: 'offline', // Start with offline mode
+            auth: 'offline',
             version: false,
         });
         
-        // CRITICAL: Override the client's session BEFORE connection
+        // Set session with converted token
         client.session = {
-            accessToken: info.accessToken,
+            accessToken: mcToken,
             selectedProfile: {
                 id: info.uuid,
                 name: info.username
             }
         };
         
-        // Override username and UUID
         client.username = info.username;
         client.uuid = info.uuid;
         
@@ -84,7 +143,7 @@ async function startBot(account) {
                 const reason = JSON.parse(packet.reason);
                 console.log(`[${info.username}] Disconnect: ${reason.text || JSON.stringify(reason)}`);
             } catch (e) {
-                console.log(`[${info.username}] Disconnect: ${packet.reason}`);
+                console.log(`[${info.username}] Disconnect`);
             }
             account.online = false;
         });
@@ -95,12 +154,8 @@ async function startBot(account) {
             bots.delete(info.username);
         });
         
-        client.on('success', () => {
-            console.log(`[${info.username}] ✅ Login successful!`);
-        });
-        
         client.on('login', (packet) => {
-            console.log(`[${info.username}] ✅ Logged into server!`);
+            console.log(`[${info.username}] ✅ Logged in!`);
             account.online = true;
         });
         
@@ -119,14 +174,11 @@ async function startBot(account) {
                 const name = parseName(text, info.username);
                 if (name && !cooldown.has(name) && !queue.includes(name)) {
                     queue.push(name);
-                    console.log(`[${info.username}] 📥 Queued: ${name} (Total: ${queue.length})`);
+                    console.log(`[${info.username}] 📥 Queued: ${name}`);
                 }
-            } catch (e) {
-                // Ignore parse errors
-            }
+            } catch (e) {}
         });
         
-        // Message sender loop
         setInterval(() => {
             if (!client.socket || !client.socket.writable) return;
             
@@ -139,13 +191,13 @@ async function startBot(account) {
                     client.write('chat', {
                         message: `/msg ${target} discord.gg\\bills cheapest market ${random}`
                     });
-                    console.log(`[${info.username}] 📨 Sent to: ${target} (Remaining: ${queue.length})`);
+                    console.log(`[${info.username}] 📨 Sent to: ${target}`);
                     
                     lastSend = now;
                     cooldown.add(target);
                     setTimeout(() => cooldown.delete(target), 5000);
                 } catch (err) {
-                    console.error(`[${info.username}] Send failed: ${err.message}`);
+                    console.error(`[${info.username}] Send failed`);
                 }
             }
         }, 100);
@@ -153,7 +205,7 @@ async function startBot(account) {
         bots.set(info.username, client);
         
     } catch (err) {
-        console.error(`[${info.username}] Failed to start: ${err.message}`);
+        console.error(`[${info.username}] Failed: ${err.message}`);
         console.error(err.stack);
         account.online = false;
     }
@@ -180,8 +232,6 @@ function parseName(text, myName) {
     if (name === myName || name.length < 3) return null;
     return name;
 }
-
-// === API ENDPOINTS ===
 
 app.get('/', (req, res) => {
     res.json({ status: 'running', bots: accounts.length });
@@ -242,7 +292,7 @@ app.listen(PORT, () => {
 });
 
 process.on('SIGTERM', () => {
-    console.log('Shutting down gracefully...');
+    console.log('Shutting down...');
     bots.forEach(client => client.end());
     process.exit(0);
 });
