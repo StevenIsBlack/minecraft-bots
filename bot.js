@@ -1,6 +1,8 @@
-const mc = require('minecraft-protocol');
+const mineflayer = require('mineflayer');
+const { Authflow, Titles } = require('prismarine-auth');
 const express = require('express');
-const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 app.use(express.json());
 
@@ -13,7 +15,6 @@ let bots = new Map();
 function parseCredentials(input) {
     const parts = input.split(':');
     if (parts.length < 3) return null;
-    
     return {
         email: parts[0],
         password: parts[1],
@@ -26,265 +27,157 @@ function decodeJWT(token) {
         const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
         const profile = payload.pfd?.[0];
         return {
-            username: profile?.name || 'Unknown',
-            uuid: profile?.id || '00000000-0000-0000-0000-000000000000',
+            username: profile?.name,
+            uuid: profile?.id,
             xuid: payload.xuid
         };
-    } catch (err) {
+    } catch {
         return null;
     }
 }
 
-// Use the Xbox token to get a Minecraft token WITHOUT interactive auth
-async function getMCTokenFromXbox(xboxToken, userHash) {
-    try {
-        console.log('Converting Xbox token to Minecraft token...');
-        
-        // First, get XSTS token
-        const xstsRes = await axios.post('https://xsts.auth.xboxlive.com/xsts/authorize', {
-            Properties: {
-                SandboxId: 'RETAIL',
-                UserTokens: [xboxToken]
-            },
-            RelyingParty: 'rp://api.minecraftservices.com/',
-            TokenType: 'JWT'
-        }, {
-            headers: { 'Content-Type': 'application/json', 'x-xbl-contract-version': '1' }
-        }).catch(err => {
-            console.log('XSTS request failed, using token directly');
-            return null;
-        });
-        
-        if (!xstsRes || xstsRes.status !== 200) {
-            console.log('Could not get XSTS token, will try direct connection');
-            return null;
-        }
-        
-        const xstsToken = xstsRes.data.Token;
-        const uhs = xstsRes.data.DisplayClaims.xui[0].uhs;
-        
-        // Get Minecraft token
-        const mcRes = await axios.post(
-            'https://api.minecraftservices.com/authentication/login_with_xbox',
-            { identityToken: `XBL3.0 x=${uhs};${xstsToken}` },
-            { headers: { 'Content-Type': 'application/json' } }
-        ).catch(err => {
-            console.log('Minecraft auth failed');
-            return null;
-        });
-        
-        if (!mcRes || mcRes.status !== 200) {
-            return null;
-        }
-        
-        console.log('✅ Got Minecraft access token!');
-        return mcRes.data.access_token;
-        
-    } catch (err) {
-        console.error('Token conversion error:', err.message);
-        return null;
+// Create fake cached auth to bypass interactive login
+async function createCachedAuth(email, xboxToken, info) {
+    const cacheDir = './auth_cache';
+    if (!fs.existsSync(cacheDir)) {
+        fs.mkdirSync(cacheDir, { recursive: true });
     }
+    
+    const cacheFile = path.join(cacheDir, `${email}.json`);
+    
+    // Create a fake cache that prismarine-auth will use
+    const fakeCache = {
+        msa: {
+            token: xboxToken,
+            expires_at: Date.now() + 86400000 // 24 hours
+        },
+        xbl: {
+            token: xboxToken,
+            userHash: info.xuid,
+            expires_at: Date.now() + 86400000
+        },
+        xsts: {
+            token: xboxToken,
+            userHash: info.xuid,
+            expires_at: Date.now() + 86400000
+        },
+        mca: {
+            access_token: xboxToken,
+            expires_at: Date.now() + 86400000,
+            profile: {
+                id: info.uuid,
+                name: info.username
+            }
+        }
+    };
+    
+    fs.writeFileSync(cacheFile, JSON.stringify(fakeCache));
+    console.log(`Created cached auth for ${email}`);
 }
 
 async function startBot(account) {
     const creds = parseCredentials(account.credentials);
-    if (!creds) {
-        console.error('Invalid credentials format');
-        return;
-    }
+    if (!creds) return;
     
     const info = decodeJWT(creds.token);
-    if (!info) {
-        console.error('Could not decode token');
-        return;
-    }
+    if (!info) return;
     
-    console.log(`\n🤖 Starting: ${info.username} (${creds.email})`);
+    console.log(`\n🚀 Starting: ${info.username}`);
     account.username = info.username;
     
     try {
-        // Try to get proper MC token
-        const mcToken = await getMCTokenFromXbox(creds.token, info.xuid);
+        // Create fake cache
+        await createCachedAuth(creds.email, creds.token, info);
         
-        // Create client with minimal auth
-        const client = mc.createClient({
-            host: SERVER,
-            port: 25565,
-            username: info.username,
-            auth: 'offline', // Start offline, inject session manually
-            version: false,
-            skipValidation: true,
+        // Use authflow which will read the cache
+        const authflow = new Authflow(creds.email, './auth_cache', {
+            authTitle: Titles.MinecraftJava,
+            flow: 'live',
+            // This should prevent interactive login
         });
         
-        // Manually inject session if we got a token
-        if (mcToken) {
-            console.log('Injecting Minecraft token into session');
-            client.session = {
-                accessToken: mcToken,
-                selectedProfile: {
-                    id: info.uuid,
-                    name: info.username
-                }
-            };
-        } else {
-            console.log('No MC token, using Xbox token directly');
-            client.session = {
-                accessToken: creds.token,
-                selectedProfile: {
-                    id: info.uuid,
-                    name: info.username
-                }
-            };
-        }
+        const bot = mineflayer.createBot({
+            host: SERVER,
+            port: 25565,
+            auth: 'microsoft',
+            authflow: authflow,
+            version: false,
+        });
         
         account.online = false;
         const queue = [];
         const cooldown = new Set();
         let lastSend = 0;
         
-        client.on('error', (err) => {
-            console.error(`[${info.username}] ❌ Error: ${err.message}`);
-        });
-        
-        client.on('kick_disconnect', (packet) => {
-            try {
-                const reason = JSON.parse(packet.reason);
-                console.error(`[${info.username}] 🚫 Kicked: ${reason.text || JSON.stringify(reason)}`);
-            } catch {
-                console.error(`[${info.username}] 🚫 Kicked: ${packet.reason}`);
-            }
+        bot.on('error', (err) => console.error(`[${info.username}] Error: ${err.message}`));
+        bot.on('kicked', (reason) => {
+            console.error(`[${info.username}] Kicked: ${reason}`);
             account.online = false;
         });
-        
-        client.on('disconnect', (packet) => {
+        bot.on('end', () => {
             console.log(`[${info.username}] Disconnected`);
-            account.online = false;
-        });
-        
-        client.on('end', () => {
-            console.log(`[${info.username}] Connection ended`);
             account.online = false;
             bots.delete(info.username);
         });
-        
-        client.on('login', (packet) => {
+        bot.on('login', () => {
             console.log(`[${info.username}] ✅ LOGGED IN!`);
             account.online = true;
         });
-        
-        client.on('chat', (packet) => {
-            try {
-                let text = '';
-                if (typeof packet.message === 'string') {
-                    const msg = JSON.parse(packet.message);
-                    text = extractText(msg);
-                } else {
-                    text = extractText(packet.message);
-                }
-                
-                if (!text || text.includes('discord.gg')) return;
-                
-                const name = parseName(text, info.username);
-                if (name && !cooldown.has(name) && !queue.includes(name)) {
-                    queue.push(name);
-                    console.log(`[${info.username}] 📥 Queued: ${name} (Total: ${queue.length})`);
-                }
-            } catch (e) {}
+        bot.on('spawn', () => console.log(`[${info.username}] 🎮 Spawned!`));
+        bot.on('messagestr', (message) => {
+            if (message.includes('discord.gg')) return;
+            const name = parseName(message, info.username);
+            if (name && !cooldown.has(name) && !queue.includes(name)) {
+                queue.push(name);
+                console.log(`[${info.username}] Queued: ${name}`);
+            }
         });
         
         setInterval(() => {
-            if (!client.socket || !client.socket.writable) return;
-            
+            if (!bot._client?.socket) return;
             const now = Date.now();
             if (now - lastSend >= 2000 && queue.length > 0) {
                 const target = queue.shift();
-                const random = Math.random().toString(36).substring(7);
-                
                 try {
-                    client.write('chat', {
-                        message: `/msg ${target} discord.gg\\bills cheapest market ${random}`
-                    });
-                    console.log(`[${info.username}] 📨 Sent to: ${target} (Queue: ${queue.length})`);
-                    
+                    bot.chat(`/msg ${target} discord.gg\\bills cheapest market ${Math.random().toString(36).substring(7)}`);
+                    console.log(`[${info.username}] Sent to: ${target}`);
                     lastSend = now;
                     cooldown.add(target);
                     setTimeout(() => cooldown.delete(target), 5000);
-                } catch (err) {}
+                } catch {}
             }
         }, 100);
         
-        bots.set(info.username, client);
-        
+        bots.set(info.username, bot);
     } catch (err) {
-        console.error(`Failed to start bot: ${err.message}`);
-        console.error(err.stack);
+        console.error(`Failed: ${err.message}`);
         account.online = false;
     }
 }
 
-function extractText(component) {
-    if (typeof component === 'string') return component;
-    if (!component) return '';
-    let text = component.text || '';
-    if (component.extra) {
-        for (const extra of component.extra) {
-            text += extractText(extra);
-        }
-    }
-    return text;
-}
-
 function parseName(text, myName) {
     if (!text.includes(':')) return null;
-    let name = text.split(':')[0].trim();
-    name = name.replace(/§./g, '').replace(/\[.*?\]/g, '').trim();
+    let name = text.split(':')[0].trim().replace(/§./g, '').replace(/\[.*?\]/g, '').trim();
     if (name.endsWith('+')) name = name.slice(0, -1);
     if (name === myName || name.length < 3) return null;
     return name;
 }
 
-app.get('/status', (req, res) => {
-    const online = accounts.filter(a => a.online).length;
-    res.json({ total: accounts.length, online });
+app.get('/status', (req, res) => res.json({ total: accounts.length, online: accounts.filter(a => a.online).length }));
+app.post('/add', (req, res) => {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'Token required' });
+    const acc = { credentials: token, username: 'Loading...', online: false };
+    accounts.push(acc);
+    startBot(acc);
+    res.json({ status: 'starting' });
 });
-
-app.post('/add', async (req, res) => {
-    try {
-        const { token } = req.body;
-        if (!token) return res.status(400).json({ error: 'Token required' });
-        
-        const creds = parseCredentials(token);
-        if (!creds) {
-            return res.status(400).json({ error: 'Invalid format' });
-        }
-        
-        const acc = { credentials: token, username: 'Loading...', online: false };
-        accounts.push(acc);
-        
-        startBot(acc);
-        
-        res.json({ status: 'starting' });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
 app.post('/stopall', (req, res) => {
-    bots.forEach(client => client.end());
+    bots.forEach(bot => bot.end());
     bots.clear();
     accounts.forEach(a => a.online = false);
     res.json({ success: true });
 });
+app.get('/list', (req, res) => res.json({ accounts: accounts.map(a => ({ username: a.username, online: a.online })) }));
 
-app.get('/list', (req, res) => {
-    const list = accounts.map(a => ({
-        username: a.username,
-        online: a.online
-    }));
-    res.json({ accounts: list });
-});
-
-app.listen(PORT, () => {
-    console.log(`🤖 Bot manager running on port ${PORT}`);
-    console.log(`📡 Will connect to: ${SERVER}:25565`);
-});
+app.listen(PORT, () => console.log(`🤖 Running on ${PORT}`));
