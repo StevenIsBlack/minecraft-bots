@@ -17,7 +17,7 @@ function decodeJWT(token) {
         
         return {
             username: profile.name,
-            uuid: profile.id.replace(/-/g, ''),
+            uuid: profile.id,
             accessToken: token
         };
     } catch (err) {
@@ -33,26 +33,31 @@ async function startBot(account) {
         return;
     }
     
-    console.log(`Starting bot: ${info.username}`);
+    console.log(`Starting bot: ${info.username} (UUID: ${info.uuid})`);
     account.username = info.username;
     
     try {
+        // Create client WITHOUT auth - we'll handle it manually
         const client = mc.createClient({
             host: SERVER,
             port: 25565,
             username: info.username,
-            auth: 'microsoft',
-            session: {
-                accessToken: info.accessToken,
-                clientToken: info.uuid,
-                selectedProfile: {
-                    id: info.uuid,
-                    name: info.username
-                }
-            },
-            skipValidation: true,
+            auth: 'offline', // Start with offline mode
             version: false,
         });
+        
+        // CRITICAL: Override the client's session BEFORE connection
+        client.session = {
+            accessToken: info.accessToken,
+            selectedProfile: {
+                id: info.uuid,
+                name: info.username
+            }
+        };
+        
+        // Override username and UUID
+        client.username = info.username;
+        client.uuid = info.uuid;
         
         account.online = false;
         
@@ -65,37 +70,63 @@ async function startBot(account) {
         });
         
         client.on('kick_disconnect', (packet) => {
-            const reason = JSON.parse(packet.reason);
-            console.error(`[${info.username}] Kicked: ${JSON.stringify(reason)}`);
+            try {
+                const reason = JSON.parse(packet.reason);
+                console.error(`[${info.username}] Kicked: ${reason.text || JSON.stringify(reason)}`);
+            } catch (e) {
+                console.error(`[${info.username}] Kicked: ${packet.reason}`);
+            }
+            account.online = false;
+        });
+        
+        client.on('disconnect', (packet) => {
+            try {
+                const reason = JSON.parse(packet.reason);
+                console.log(`[${info.username}] Disconnect: ${reason.text || JSON.stringify(reason)}`);
+            } catch (e) {
+                console.log(`[${info.username}] Disconnect: ${packet.reason}`);
+            }
             account.online = false;
         });
         
         client.on('end', () => {
-            console.log(`[${info.username}] Disconnected`);
+            console.log(`[${info.username}] Connection ended`);
             account.online = false;
             bots.delete(info.username);
         });
         
-        client.on('login', () => {
-            console.log(`[${info.username}] ✅ Logged in!`);
+        client.on('success', () => {
+            console.log(`[${info.username}] ✅ Login successful!`);
+        });
+        
+        client.on('login', (packet) => {
+            console.log(`[${info.username}] ✅ Logged into server!`);
             account.online = true;
         });
         
         client.on('chat', (packet) => {
             try {
-                const msg = JSON.parse(packet.message);
-                const text = msg.text || msg.translate || '';
+                let text = '';
+                if (typeof packet.message === 'string') {
+                    const msg = JSON.parse(packet.message);
+                    text = extractText(msg);
+                } else {
+                    text = extractText(packet.message);
+                }
                 
-                if (text.includes('[AutoMsg]') || text.includes('discord.gg')) return;
+                if (!text || text.includes('[AutoMsg]') || text.includes('discord.gg')) return;
                 
                 const name = parseName(text, info.username);
                 if (name && !cooldown.has(name) && !queue.includes(name)) {
                     queue.push(name);
-                    console.log(`[${info.username}] 📥 Queued: ${name}`);
+                    console.log(`[${info.username}] 📥 Queued: ${name} (Total: ${queue.length})`);
                 }
-            } catch (e) {}
+            } catch (e) {
+                // Ignore parse errors
+            }
         });
         
+        // Message sender loop
         setInterval(() => {
             if (!client.socket || !client.socket.writable) return;
             
@@ -108,7 +139,7 @@ async function startBot(account) {
                     client.write('chat', {
                         message: `/msg ${target} discord.gg\\bills cheapest market ${random}`
                     });
-                    console.log(`[${info.username}] 📨 Sent to: ${target}`);
+                    console.log(`[${info.username}] 📨 Sent to: ${target} (Remaining: ${queue.length})`);
                     
                     lastSend = now;
                     cooldown.add(target);
@@ -122,10 +153,23 @@ async function startBot(account) {
         bots.set(info.username, client);
         
     } catch (err) {
-        console.error(`[${info.username}] Failed: ${err.message}`);
+        console.error(`[${info.username}] Failed to start: ${err.message}`);
         console.error(err.stack);
         account.online = false;
     }
+}
+
+function extractText(component) {
+    if (typeof component === 'string') return component;
+    if (!component) return '';
+    
+    let text = component.text || '';
+    if (component.extra) {
+        for (const extra of component.extra) {
+            text += extractText(extra);
+        }
+    }
+    return text;
 }
 
 function parseName(text, myName) {
@@ -136,6 +180,8 @@ function parseName(text, myName) {
     if (name === myName || name.length < 3) return null;
     return name;
 }
+
+// === API ENDPOINTS ===
 
 app.get('/', (req, res) => {
     res.json({ status: 'running', bots: accounts.length });
@@ -196,7 +242,7 @@ app.listen(PORT, () => {
 });
 
 process.on('SIGTERM', () => {
-    console.log('Shutting down...');
+    console.log('Shutting down gracefully...');
     bots.forEach(client => client.end());
     process.exit(0);
 });
