@@ -40,23 +40,21 @@ async function createBot(botId, host, port, sessionToken) {
         if (!mcName) throw new Error('No username in token');
         
         console.log(`[${botId}] Account: ${mcName}`);
+        console.log(`[${botId}] UUID: ${mcProfile}`);
         
-        // CRITICAL FIX: Create client with NO auth, then manually handle encryption
         const client = mc.createClient({
             host: host,
             port: port,
             username: mcName,
-            auth: 'offline', // Start offline
+            auth: 'offline',
             version: false,
-            // DISABLE all Microsoft auth attempts
             skipValidation: true,
             hideErrors: false
         });
         
-        // INTERCEPT the encryption request and inject our token
+        // Session injection
         client.on('session', (session) => {
-            console.log(`[${botId}] Session requested, injecting token...`);
-            // Override with our session
+            console.log(`[${botId}] Session requested, injecting...`);
             client.session = {
                 accessToken: accessToken,
                 clientToken: tokenData.xuid,
@@ -67,10 +65,8 @@ async function createBot(botId, host, port, sessionToken) {
             };
         });
         
-        // FORCE the client to use our session before encryption starts
         const originalWrite = client.write.bind(client);
         client.write = function(name, params) {
-            // Before any encryption handshake, inject session
             if (name === 'login_start' || name === 'encryption_begin') {
                 console.log(`[${botId}] Injecting session before ${name}`);
                 client.session = {
@@ -85,34 +81,65 @@ async function createBot(botId, host, port, sessionToken) {
             return originalWrite(name, params);
         };
         
+        client.on('connect', () => {
+            console.log(`[${botId}] 🔌 Connected to server`);
+        });
+        
         client.on('error', (err) => {
-            console.error(`❌ [${botId}] Error: ${err.message}`);
+            console.error(`[${botId}] ❌ Error: ${err.message}`);
+            console.error(`[${botId}] Stack: ${err.stack}`);
         });
         
         client.on('kick_disconnect', (packet) => {
             try {
                 const reason = JSON.parse(packet.reason);
-                console.error(`❌ [${botId}] Kicked: ${reason.text || JSON.stringify(reason)}`);
+                console.error(`[${botId}] 🚫 KICKED: ${reason.text || JSON.stringify(reason)}`);
             } catch {
-                console.error(`❌ [${botId}] Kicked`);
+                console.error(`[${botId}] 🚫 KICKED: ${packet.reason}`);
             }
             bots.delete(botId);
         });
         
-        client.on('end', () => {
-            console.log(`[${botId}] Disconnected`);
+        client.on('disconnect', (packet) => {
+            try {
+                const reason = JSON.parse(packet.reason);
+                console.log(`[${botId}] 🔌 DISCONNECT packet: ${reason.text || JSON.stringify(reason)}`);
+            } catch {
+                console.log(`[${botId}] 🔌 DISCONNECT packet: ${JSON.stringify(packet)}`);
+            }
             bots.delete(botId);
         });
         
-        client.on('login', () => {
-            console.log(`✅✅✅ [${botId}] LOGGED IN AS ${mcName}! ✅✅✅`);
+        client.on('end', (reason) => {
+            console.log(`[${botId}] 🔌 Connection ended: ${reason || 'Unknown reason'}`);
+            bots.delete(botId);
+        });
+        
+        client.on('login', (packet) => {
+            console.log(`[${botId}] ✅✅✅ LOGGED IN! ✅✅✅`);
+            console.log(`[${botId}] Login packet:`, JSON.stringify(packet, null, 2));
+        });
+        
+        client.on('spawn_position', () => {
+            console.log(`[${botId}] 🎮 SPAWNED IN GAME!`);
+        });
+        
+        client.on('position', (packet) => {
+            console.log(`[${botId}] 📍 Position update: ${JSON.stringify(packet)}`);
         });
         
         client.on('chat', (packet) => {
             try {
                 let text = typeof packet.message === 'string' ? JSON.parse(packet.message) : packet.message;
-                console.log(`[${botId}] Chat: ${extractText(text)}`);
+                console.log(`[${botId}] 💬 Chat: ${extractText(text)}`);
             } catch {}
+        });
+        
+        // Log ALL packets for debugging
+        client.on('packet', (data, metadata) => {
+            if (metadata.name !== 'keep_alive') { // Ignore keepalive spam
+                console.log(`[${botId}] 📦 Packet: ${metadata.name}`);
+            }
         });
         
         bots.set(botId, { client, mcName });
@@ -120,7 +147,8 @@ async function createBot(botId, host, port, sessionToken) {
         return { success: true, mcUsername: mcName, uuid: mcProfile };
         
     } catch (error) {
-        console.error(`❌ [${botId}] Failed: ${error.message}`);
+        console.error(`[${botId}] ❌ Failed: ${error.message}`);
+        console.error(error.stack);
         throw error;
     }
 }
