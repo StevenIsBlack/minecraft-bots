@@ -1,200 +1,301 @@
-const mc = require('minecraft-protocol');
+const mineflayer = require('mineflayer');
 const express = require('express');
 const app = express();
+
 app.use(express.json());
 
-const SERVER = process.env.SERVER_IP || 'donutsmp.net';
-const PORT = process.env.PORT || 8080;
+const bots = new Map();
 
-let accounts = [];
-let bots = new Map();
-
-console.log('=================================');
-console.log('Minecraft Bot Manager Starting...');
-console.log('Server:', SERVER);
-console.log('Port:', PORT);
-console.log('=================================');
-
-function parseCredentials(input) {
-    const parts = input.split(':');
-    if (parts.length < 3) return null;
-    return { 
-        email: parts[0], 
-        password: parts[1], 
-        token: parts.slice(2).join(':') 
+// Parse token format: email:password:jwt_token
+function parseToken(tokenString) {
+    const colonIndex = tokenString.indexOf(':');
+    const secondColonIndex = tokenString.indexOf(':', colonIndex + 1);
+    
+    if (colonIndex === -1 || secondColonIndex === -1) {
+        throw new Error('Invalid token format. Expected: email:password:token');
+    }
+    
+    return {
+        email: tokenString.substring(0, colonIndex),
+        password: tokenString.substring(colonIndex + 1, secondColonIndex),
+        accessToken: tokenString.substring(secondColonIndex + 1)
     };
 }
 
+// Decode JWT without verification
 function decodeJWT(token) {
     try {
         const parts = token.split('.');
-        if (parts.length < 2) return null;
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64'));
-        const profile = payload.pfd?.[0];
-        return { 
-            username: profile?.name || 'Bot' + Date.now(), 
-            uuid: profile?.id || 'uuid'
-        };
+        const payload = Buffer.from(parts[1], 'base64').toString('utf8');
+        return JSON.parse(payload);
     } catch (e) {
-        console.error('JWT decode error:', e.message);
-        return null;
+        throw new Error('Failed to decode JWT: ' + e.message);
     }
 }
 
-async function startBot(account) {
+// Main bot creation function
+async function createBot(botId, host, port, sessionToken) {
     try {
-        const creds = parseCredentials(account.credentials);
-        if (!creds) {
-            console.error('Invalid credentials');
-            return;
+        console.log(`[${botId}] Parsing session token...`);
+        const { email, password, accessToken } = parseToken(sessionToken);
+        
+        console.log(`[${botId}] Decoding JWT...`);
+        const tokenData = decodeJWT(accessToken);
+        
+        // Extract Minecraft profile from token
+        const mcProfile = tokenData.profiles?.mc;
+        const mcName = tokenData.pfd?.[0]?.name;
+        
+        if (!mcProfile || !mcName) {
+            throw new Error('Token missing Minecraft profile data');
         }
         
-        const info = decodeJWT(creds.token);
-        if (!info) {
-            console.error('Invalid token');
-            return;
+        console.log(`[${botId}] Account: ${mcName} (${mcProfile})`);
+        console.log(`[${botId}] Token expires: ${new Date(tokenData.exp * 1000).toISOString()}`);
+        
+        // Check if token is expired
+        if (tokenData.exp * 1000 < Date.now()) {
+            throw new Error('Access token has expired');
         }
         
-        console.log(`[${info.username}] Starting bot...`);
-        account.username = info.username;
-        account.online = false;
+        // Create the bot with Microsoft auth
+        console.log(`[${botId}] Connecting to ${host}:${port}...`);
         
-        const client = mc.createClient({
-            host: SERVER,
-            port: 25565,
-            username: info.username,
+        const bot = mineflayer.createBot({
+            host: host,
+            port: port,
+            username: email,
             auth: 'microsoft',
             session: {
-                accessToken: creds.token,
-                clientToken: 'client',
+                accessToken: accessToken,
+                clientToken: tokenData.aid || '00000000-0000-0000-0000-000000000000',
                 selectedProfile: {
-                    id: info.uuid,
-                    name: info.username
+                    id: mcProfile,
+                    name: mcName
                 }
-            }
+            },
+            skipValidation: true,
+            version: false,
+            hideErrors: false
         });
         
-        const queue = [];
-        const cooldown = new Set();
-        let lastSend = 0;
-        
-        client.on('error', (e) => {
-            console.error(`[${info.username}] Error: ${e.message}`);
+        // Event handlers
+        bot.on('login', () => {
+            console.log(`✅ [${botId}] Successfully logged in as ${bot.username}`);
         });
         
-        client.on('end', () => {
-            console.log(`[${info.username}] Disconnected, reconnecting in 10s...`);
-            account.online = false;
-            bots.delete(info.username);
-            setTimeout(() => startBot(account), 10000);
+        bot.on('spawn', () => {
+            console.log(`✅ [${botId}] Spawned in game`);
         });
         
-        client.on('login', () => {
-            console.log(`[${info.username}] ✅ LOGGED IN`);
-            account.online = true;
+        bot.on('error', (err) => {
+            console.error(`❌ [${botId}] Error: ${err.message}`);
         });
         
-        client.on('chat', (packet) => {
-            try {
-                let text = typeof packet.message === 'string' 
-                    ? JSON.parse(packet.message) 
-                    : packet.message;
-                
-                text = extractText(text);
-                if (!text || text.includes('discord.gg')) return;
-                
-                const name = parseName(text, info.username);
-                if (name && !cooldown.has(name) && !queue.includes(name)) {
-                    queue.push(name);
-                }
-            } catch {}
+        bot.on('kicked', (reason) => {
+            console.log(`❌ [${botId}] Kicked: ${reason}`);
+            bots.delete(botId);
         });
         
-        setInterval(() => {
-            if (!client.socket?.writable) return;
-            const now = Date.now();
-            if (now - lastSend >= 2000 && queue.length > 0) {
-                const target = queue.shift();
-                try {
-                    const rand = Math.random().toString(36).substring(7);
-                    client.write('chat', { 
-                        message: `/msg ${target} discord.gg\\bills cheapest market ${rand}` 
-                    });
-                    lastSend = now;
-                    cooldown.add(target);
-                    setTimeout(() => cooldown.delete(target), 5000);
-                } catch {}
-            }
-        }, 100);
+        bot.on('end', (reason) => {
+            console.log(`[${botId}] Disconnected: ${reason}`);
+            bots.delete(botId);
+        });
         
-        bots.set(info.username, client);
+        bot.on('death', () => {
+            console.log(`💀 [${botId}] Died. Respawning...`);
+            setTimeout(() => bot.chat('/respawn'), 1000);
+        });
+        
+        bot.on('message', (message) => {
+            console.log(`[${botId}] ${message.toString()}`);
+        });
+        
+        bots.set(botId, bot);
+        
+        return {
+            success: true,
+            mcUsername: mcName,
+            uuid: mcProfile
+        };
         
     } catch (error) {
-        console.error('startBot error:', error);
+        console.error(`❌ [${botId}] Failed to create bot: ${error.message}`);
+        throw error;
     }
 }
 
-function extractText(c) {
-    if (typeof c === 'string') return c;
-    if (!c) return '';
-    let text = c.text || '';
-    if (c.extra) c.extra.forEach(e => text += extractText(e));
-    return text;
-}
+// API Endpoints
+app.post('/add', async (req, res) => {
+    try {
+        const { username, token, host = 'donutsmp.net', port = 25565 } = req.body;
+        
+        if (!username || !token) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Missing required fields: username, token' 
+            });
+        }
+        
+        if (bots.has(username)) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Bot already running' 
+            });
+        }
+        
+        console.log(`[${username}] Received start request`);
+        const result = await createBot(username, host, port, token);
+        
+        res.json({ 
+            success: true, 
+            message: `Bot ${username} started successfully`,
+            ...result
+        });
+        
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
 
-function parseName(text, myName) {
-    if (!text?.includes(':')) return null;
-    let name = text.split(':')[0].trim().replace(/§./g, '').replace(/\[.*?\]/g, '').trim();
-    if (name.endsWith('+')) name = name.slice(0, -1);
-    return (name === myName || name.length < 3) ? null : name;
-}
+app.post('/remove', (req, res) => {
+    const { username } = req.body;
+    
+    if (!username) {
+        return res.status(400).json({ success: false, error: 'Missing username' });
+    }
+    
+    const bot = bots.get(username);
+    if (!bot) {
+        return res.status(404).json({ success: false, error: 'Bot not found' });
+    }
+    
+    bot.quit('Stopped via API');
+    bots.delete(username);
+    
+    res.json({ success: true, message: `Bot ${username} stopped` });
+});
 
-// Routes
-app.get('/', (req, res) => {
-    console.log('GET / - Health check');
-    res.json({ status: 'running', accounts: accounts.length, online: accounts.filter(a => a.online).length });
+app.post('/chat', (req, res) => {
+    const { username, message } = req.body;
+    
+    if (!username || !message) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Missing username or message' 
+        });
+    }
+    
+    const bot = bots.get(username);
+    if (!bot) {
+        return res.status(404).json({ success: false, error: 'Bot not found' });
+    }
+    
+    bot.chat(message);
+    console.log(`[${username}] Sent: ${message}`);
+    
+    res.json({ success: true });
 });
 
 app.get('/status', (req, res) => {
-    console.log('GET /status');
-    const online = accounts.filter(a => a.online).length;
-    res.json({ total: accounts.length, online: online, offline: accounts.length - online });
-});
-
-app.post('/add', (req, res) => {
-    console.log('POST /add');
-    const { token } = req.body;
-    if (!token) return res.status(400).json({ error: 'Token required' });
+    const status = Array.from(bots.entries()).map(([username, bot]) => ({
+        username,
+        mcUsername: bot.username,
+        connected: bot.player !== undefined && bot.player !== null,
+        health: bot.health || 0,
+        food: bot.food || 0,
+        position: bot.position ? {
+            x: Math.floor(bot.position.x),
+            y: Math.floor(bot.position.y),
+            z: Math.floor(bot.position.z)
+        } : null
+    }));
     
-    const acc = { credentials: token, username: 'Loading...', online: false };
-    accounts.push(acc);
-    startBot(acc);
-    
-    res.json({ status: 'starting', username: acc.username });
-});
-
-app.post('/startall', (req, res) => {
-    console.log('POST /startall');
-    accounts.forEach(a => {
-        if (!bots.has(a.username)) startBot(a);
+    res.json({ 
+        success: true,
+        count: bots.size,
+        bots: status 
     });
-    res.json({ success: true, message: 'Starting all bots' });
 });
 
-app.post('/stopall', (req, res) => {
-    console.log('POST /stopall');
-    bots.forEach(c => c.end());
-    bots.clear();
-    accounts.forEach(a => a.online = false);
-    res.json({ success: true, message: 'Stopped all bots' });
+app.post('/startall', async (req, res) => {
+    const { tokens, host = 'donutsmp.net', port = 25565 } = req.body;
+    
+    if (!tokens || !Array.isArray(tokens)) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'tokens must be an array' 
+        });
+    }
+    
+    console.log(`Starting ${tokens.length} bots...`);
+    const results = [];
+    
+    for (const botData of tokens) {
+        const { username, token } = botData;
+        
+        try {
+            if (bots.has(username)) {
+                results.push({ 
+                    username, 
+                    success: false, 
+                    error: 'Already running' 
+                });
+                continue;
+            }
+            
+            const result = await createBot(username, host, port, token);
+            results.push({ username, ...result });
+            
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+        } catch (error) {
+            results.push({ 
+                username, 
+                success: false, 
+                error: error.message 
+            });
+        }
+    }
+    
+    res.json({ 
+        success: true, 
+        results,
+        started: results.filter(r => r.success).length,
+        failed: results.filter(r => !r.success).length
+    });
 });
 
-app.get('/list', (req, res) => {
-    console.log('GET /list');
-    res.json({ accounts: accounts.map(a => ({ username: a.username, online: a.online })) });
+app.get('/', (req, res) => {
+    res.json({ 
+        status: 'online',
+        uptime: process.uptime(),
+        bots: bots.size
+    });
 });
 
+app.get('/health', (req, res) => {
+    res.json({ healthy: true, bots: bots.size });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully...');
+    bots.forEach((bot, username) => {
+        bot.quit('Server shutting down');
+    });
+    process.exit(0);
+});
+
+// Start server
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
+    console.log('=================================');
+    console.log('Minecraft Bot Manager Starting...');
+    console.log(`Server: donutsmp.net`);
     console.log('=================================');
     console.log(`✅ Bot Manager Running on Port ${PORT}`);
     console.log('=================================');
