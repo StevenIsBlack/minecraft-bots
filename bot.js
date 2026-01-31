@@ -1,11 +1,19 @@
 const mc = require('minecraft-protocol');
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 
 app.use(express.json());
 
 const bots = new Map();
+const CACHE_DIR = process.env.CACHE_DIR || './auth_cache';
+
+// Ensure cache directory exists
+if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
 function parseToken(tokenString) {
     const parts = tokenString.split(':');
@@ -29,12 +37,10 @@ function decodeJWT(token) {
     }
 }
 
-// Convert Xbox token to Minecraft session token
 async function xboxToMinecraft(xboxToken, xuid) {
     try {
         console.log('🔄 Converting Xbox token to Minecraft token...');
         
-        // Step 1: Get XSTS token
         const xstsRes = await axios.post('https://xsts.auth.xboxlive.com/xsts/authorize', {
             Properties: {
                 SandboxId: 'RETAIL',
@@ -52,16 +58,13 @@ async function xboxToMinecraft(xboxToken, xuid) {
         });
         
         if (xstsRes.status !== 200) {
-            console.log('❌ XSTS failed, using direct token');
+            console.log('❌ XSTS failed');
             return null;
         }
         
         const xstsToken = xstsRes.data.Token;
         const userHash = xstsRes.data.DisplayClaims.xui[0].uhs;
         
-        console.log('✅ Got XSTS token');
-        
-        // Step 2: Get Minecraft access token
         const mcRes = await axios.post(
             'https://api.minecraftservices.com/authentication/login_with_xbox',
             { identityToken: `XBL3.0 x=${userHash};${xstsToken}` },
@@ -72,11 +75,11 @@ async function xboxToMinecraft(xboxToken, xuid) {
         );
         
         if (mcRes.status !== 200) {
-            console.log('❌ MC auth failed, using direct token');
+            console.log('❌ MC auth failed');
             return null;
         }
         
-        console.log('✅ Got Minecraft access token!');
+        console.log('✅ Got Minecraft token!');
         return mcRes.data.access_token;
         
     } catch (err) {
@@ -100,15 +103,27 @@ async function createBot(botId, host, port, sessionToken) {
         console.log(`[${botId}] Account: ${mcName}`);
         console.log(`[${botId}] UUID: ${mcProfile}`);
         
-        // Try to convert Xbox token to MC token
         let finalToken = accessToken;
         const mcToken = await xboxToMinecraft(accessToken, xuid);
         if (mcToken) {
-            console.log(`[${botId}] ✅ Using converted Minecraft token`);
+            console.log(`[${botId}] ✅ Using converted token`);
             finalToken = mcToken;
         } else {
             console.log(`[${botId}] ⚠️ Using Xbox token directly`);
         }
+        
+        // Create auth cache file to prevent re-auth
+        const cacheFile = path.join(CACHE_DIR, `${email}.json`);
+        const cacheData = {
+            accessToken: finalToken,
+            clientToken: xuid,
+            selectedProfile: {
+                id: mcProfile,
+                name: mcName
+            }
+        };
+        fs.writeFileSync(cacheFile, JSON.stringify(cacheData));
+        console.log(`[${botId}] 💾 Saved auth cache`);
         
         console.log(`[${botId}] Connecting...`);
         
@@ -116,7 +131,7 @@ async function createBot(botId, host, port, sessionToken) {
             host: host,
             port: port,
             username: mcName,
-            auth: 'microsoft', // Tell server we're Microsoft auth
+            auth: 'microsoft',
             session: {
                 accessToken: finalToken,
                 clientToken: xuid,
@@ -126,24 +141,21 @@ async function createBot(botId, host, port, sessionToken) {
                 }
             },
             skipValidation: true,
+            profilesFolder: CACHE_DIR, // Use cache directory
             version: false,
             hideErrors: false
         });
         
-        client.on('connect', () => {
-            console.log(`[${botId}] 🔌 Connected`);
-        });
+        client.on('connect', () => console.log(`[${botId}] 🔌 Connected`));
         
-        client.on('error', (err) => {
-            console.error(`[${botId}] ❌ Error: ${err.message}`);
-        });
+        client.on('error', (err) => console.error(`[${botId}] ❌ Error: ${err.message}`));
         
         client.on('kick_disconnect', (packet) => {
             try {
                 const reason = JSON.parse(packet.reason);
                 console.error(`[${botId}] 🚫 KICKED: ${reason.text || JSON.stringify(reason)}`);
             } catch {
-                console.error(`[${botId}] 🚫 KICKED: ${packet.reason}`);
+                console.error(`[${botId}] 🚫 KICKED`);
             }
             bots.delete(botId);
         });
@@ -151,15 +163,15 @@ async function createBot(botId, host, port, sessionToken) {
         client.on('disconnect', (packet) => {
             try {
                 const reason = JSON.parse(packet.reason);
-                console.log(`[${botId}] 🔌 DISCONNECT: ${reason.text || JSON.stringify(reason)}`);
+                console.log(`[${botId}] 🔌 DISCONNECT: ${reason.text}`);
             } catch {
                 console.log(`[${botId}] 🔌 DISCONNECT`);
             }
             bots.delete(botId);
         });
         
-        client.on('end', (reason) => {
-            console.log(`[${botId}] 🔌 Ended: ${reason || 'Unknown'}`);
+        client.on('end', () => {
+            console.log(`[${botId}] 🔌 Ended`);
             bots.delete(botId);
         });
         
@@ -240,4 +252,7 @@ app.get('/', (req, res) => res.json({ status: 'online', bots: bots.size }));
 app.get('/health', (req, res) => res.json({ healthy: true }));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`✅ Running on ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`✅ Running on ${PORT}`);
+    console.log(`📁 Auth cache: ${CACHE_DIR}`);
+});
