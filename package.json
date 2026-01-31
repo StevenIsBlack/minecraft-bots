@@ -2,9 +2,9 @@
   "name": "minecraft-bot-manager",
   "version": "1.0.0",
   "description": "Minecraft bot manager with session token authentication",
-  "main": "index.js",
+  "main": "bot.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node bot.js"
   },
   "dependencies": {
     "mineflayer": "^4.20.1",
