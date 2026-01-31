@@ -1,4 +1,4 @@
-const mineflayer = require('mineflayer');
+const mc = require('minecraft-protocol');
 const express = require('express');
 const app = express();
 
@@ -7,124 +7,111 @@ app.use(express.json());
 const bots = new Map();
 
 function parseToken(tokenString) {
-    try {
-        // Handle format: email:password:jwt_token
-        const parts = tokenString.split(':');
-        
-        if (parts.length < 3) {
-            throw new Error('Invalid token format. Expected: email:password:token');
-        }
-        
-        const email = parts[0];
-        const password = parts[1];
-        const accessToken = parts.slice(2).join(':'); // JWT might contain colons
-        
-        return { email, password, accessToken };
-    } catch (e) {
-        throw new Error('Token parsing failed: ' + e.message);
+    const parts = tokenString.split(':');
+    if (parts.length < 3) {
+        throw new Error('Invalid format. Use: email:password:token');
     }
+    
+    return {
+        email: parts[0],
+        password: parts[1],
+        accessToken: parts.slice(2).join(':')
+    };
 }
 
 function decodeJWT(token) {
     try {
-        // Remove any whitespace
         token = token.trim();
-        
         const parts = token.split('.');
-        if (parts.length !== 3) {
-            throw new Error('Invalid JWT format');
-        }
+        if (parts.length !== 3) throw new Error('Invalid JWT');
         
-        // Add padding if needed
         let payload = parts[1];
-        while (payload.length % 4 !== 0) {
-            payload += '=';
-        }
+        while (payload.length % 4 !== 0) payload += '=';
         
         const decoded = Buffer.from(payload, 'base64').toString('utf8');
         return JSON.parse(decoded);
     } catch (e) {
-        throw new Error('Failed to decode JWT: ' + e.message);
+        throw new Error('JWT decode failed: ' + e.message);
     }
 }
 
 async function createBot(botId, host, port, sessionToken) {
     try {
-        console.log(`[${botId}] Parsing session token...`);
+        console.log(`[${botId}] Starting...`);
         const { email, password, accessToken } = parseToken(sessionToken);
         
-        console.log(`[${botId}] Decoding JWT...`);
         const tokenData = decodeJWT(accessToken);
-        
-        console.log(`[${botId}] Token data:`, JSON.stringify(tokenData, null, 2));
-        
-        // Extract Minecraft profile
         const mcProfile = tokenData.profiles?.mc || tokenData.pfd?.[0]?.id;
         const mcName = tokenData.pfd?.[0]?.name;
-        const xuid = tokenData.xuid;
         
-        if (!mcName) {
-            throw new Error('Token missing Minecraft username');
-        }
+        if (!mcName) throw new Error('No Minecraft username in token');
         
-        console.log(`[${botId}] Account: ${mcName}`);
-        console.log(`[${botId}] UUID: ${mcProfile}`);
-        console.log(`[${botId}] XUID: ${xuid}`);
+        console.log(`[${botId}] Account: ${mcName} (${mcProfile})`);
+        console.log(`[${botId}] Connecting...`);
         
-        // Check expiration
-        if (tokenData.exp && tokenData.exp * 1000 < Date.now()) {
-            throw new Error('Access token has expired');
-        }
-        
-        console.log(`[${botId}] Connecting to ${host}:${port}...`);
-        
-        const bot = mineflayer.createBot({
+        // CRITICAL: Use minecraft-protocol with session injection
+        const client = mc.createClient({
             host: host,
             port: port,
             username: mcName,
-            auth: 'offline', // Critical: use offline mode
+            // Tell the server we're authenticated
+            auth: 'microsoft',
+            // Provide the session
+            session: {
+                accessToken: accessToken,
+                clientToken: tokenData.xuid || tokenData.aid,
+                selectedProfile: {
+                    id: mcProfile,
+                    name: mcName
+                }
+            },
+            // Don't validate with Microsoft (we already have token)
             skipValidation: true,
-            version: false,
-            hideErrors: false
+            version: false
         });
         
-        // Manually inject session after connection
-        bot.session = {
-            accessToken: accessToken,
-            clientToken: xuid || '00000000-0000-0000-0000-000000000000',
-            selectedProfile: {
-                id: mcProfile || '00000000-0000-0000-0000-000000000000',
-                name: mcName
-            }
-        };
-        
-        bot.on('login', () => {
-            console.log(`✅ [${botId}] Logged in as ${bot.username}`);
-        });
-        
-        bot.on('spawn', () => {
-            console.log(`✅ [${botId}] Spawned in game`);
-        });
-        
-        bot.on('error', (err) => {
+        client.on('error', (err) => {
             console.error(`❌ [${botId}] Error: ${err.message}`);
         });
         
-        bot.on('kicked', (reason) => {
-            console.log(`❌ [${botId}] Kicked: ${reason}`);
+        client.on('kick_disconnect', (packet) => {
+            try {
+                const reason = JSON.parse(packet.reason);
+                console.error(`❌ [${botId}] Kicked: ${reason.text || JSON.stringify(reason)}`);
+            } catch {
+                console.error(`❌ [${botId}] Kicked: ${packet.reason}`);
+            }
             bots.delete(botId);
         });
         
-        bot.on('end', (reason) => {
-            console.log(`[${botId}] Disconnected: ${reason}`);
+        client.on('disconnect', (packet) => {
+            console.log(`[${botId}] Disconnected`);
             bots.delete(botId);
         });
         
-        bot.on('messagestr', (message) => {
-            console.log(`[${botId}] ${message}`);
+        client.on('end', () => {
+            console.log(`[${botId}] Connection ended`);
+            bots.delete(botId);
         });
         
-        bots.set(botId, bot);
+        client.on('login', (packet) => {
+            console.log(`✅ [${botId}] LOGGED IN AS ${mcName}!`);
+        });
+        
+        client.on('chat', (packet) => {
+            try {
+                let text = '';
+                if (typeof packet.message === 'string') {
+                    const msg = JSON.parse(packet.message);
+                    text = extractText(msg);
+                } else {
+                    text = extractText(packet.message);
+                }
+                console.log(`[${botId}] ${text}`);
+            } catch {}
+        });
+        
+        bots.set(botId, { client, mcName, mcProfile });
         
         return {
             success: true,
@@ -134,9 +121,20 @@ async function createBot(botId, host, port, sessionToken) {
         
     } catch (error) {
         console.error(`❌ [${botId}] Failed: ${error.message}`);
-        console.error(error.stack);
         throw error;
     }
+}
+
+function extractText(component) {
+    if (typeof component === 'string') return component;
+    if (!component) return '';
+    let text = component.text || '';
+    if (component.extra) {
+        for (const extra of component.extra) {
+            text += extractText(extra);
+        }
+    }
+    return text;
 }
 
 app.post('/add', async (req, res) => {
@@ -146,7 +144,7 @@ app.post('/add', async (req, res) => {
         if (!username || !token) {
             return res.status(400).json({ 
                 success: false, 
-                error: 'Missing required fields: username, token' 
+                error: 'Missing username or token' 
             });
         }
         
@@ -157,12 +155,11 @@ app.post('/add', async (req, res) => {
             });
         }
         
-        console.log(`[${username}] Received start request`);
         const result = await createBot(username, host, port, token);
         
         res.json({ 
             success: true, 
-            message: `Bot ${username} started successfully`,
+            message: 'Bot started',
             ...result
         });
         
@@ -176,7 +173,6 @@ app.post('/add', async (req, res) => {
 
 app.post('/remove', (req, res) => {
     const { username } = req.body;
-    
     if (!username) {
         return res.status(400).json({ success: false, error: 'Missing username' });
     }
@@ -186,17 +182,16 @@ app.post('/remove', (req, res) => {
         return res.status(404).json({ success: false, error: 'Bot not found' });
     }
     
-    bot.quit('Stopped via API');
+    bot.client.end('Stopped');
     bots.delete(username);
     
-    res.json({ success: true, message: `Bot ${username} stopped` });
+    res.json({ success: true });
 });
 
 app.post('/chat', (req, res) => {
     const { username, message } = req.body;
-    
     if (!username || !message) {
-        return res.status(400).json({ success: false, error: 'Missing username or message' });
+        return res.status(400).json({ success: false, error: 'Missing data' });
     }
     
     const bot = bots.get(username);
@@ -204,19 +199,15 @@ app.post('/chat', (req, res) => {
         return res.status(404).json({ success: false, error: 'Bot not found' });
     }
     
-    bot.chat(message);
-    console.log(`[${username}] Sent: ${message}`);
-    
+    bot.client.write('chat', { message });
     res.json({ success: true });
 });
 
 app.get('/status', (req, res) => {
     const status = Array.from(bots.entries()).map(([username, bot]) => ({
         username,
-        mcUsername: bot.username,
-        connected: bot.player !== undefined && bot.player !== null,
-        health: bot.health || 0,
-        food: bot.food || 0
+        mcUsername: bot.mcName,
+        connected: bot.client.socket && bot.client.socket.writable
     }));
     
     res.json({ 
@@ -226,27 +217,10 @@ app.get('/status', (req, res) => {
     });
 });
 
-app.get('/', (req, res) => {
-    res.json({ 
-        status: 'online',
-        uptime: process.uptime(),
-        bots: bots.size
-    });
-});
-
-app.get('/health', (req, res) => {
-    res.json({ healthy: true, bots: bots.size });
-});
-
-process.on('SIGTERM', () => {
-    console.log('Shutting down...');
-    bots.forEach((bot) => bot.quit('Server shutting down'));
-    process.exit(0);
-});
+app.get('/', (req, res) => res.json({ status: 'online', bots: bots.size }));
+app.get('/health', (req, res) => res.json({ healthy: true }));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-    console.log('=================================');
-    console.log('✅ Bot Manager Running on Port', PORT);
-    console.log('=================================');
+    console.log(`✅ Bot Manager on port ${PORT}`);
 });
