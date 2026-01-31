@@ -1,5 +1,6 @@
 const mc = require('minecraft-protocol');
 const express = require('express');
+const axios = require('axios');
 const app = express();
 
 app.use(express.json());
@@ -28,6 +29,62 @@ function decodeJWT(token) {
     }
 }
 
+// Convert Xbox token to Minecraft session token
+async function xboxToMinecraft(xboxToken, xuid) {
+    try {
+        console.log('🔄 Converting Xbox token to Minecraft token...');
+        
+        // Step 1: Get XSTS token
+        const xstsRes = await axios.post('https://xsts.auth.xboxlive.com/xsts/authorize', {
+            Properties: {
+                SandboxId: 'RETAIL',
+                UserTokens: [xboxToken]
+            },
+            RelyingParty: 'rp://api.minecraftservices.com/',
+            TokenType: 'JWT'
+        }, {
+            headers: { 
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'x-xbl-contract-version': '1'
+            },
+            validateStatus: () => true
+        });
+        
+        if (xstsRes.status !== 200) {
+            console.log('❌ XSTS failed, using direct token');
+            return null;
+        }
+        
+        const xstsToken = xstsRes.data.Token;
+        const userHash = xstsRes.data.DisplayClaims.xui[0].uhs;
+        
+        console.log('✅ Got XSTS token');
+        
+        // Step 2: Get Minecraft access token
+        const mcRes = await axios.post(
+            'https://api.minecraftservices.com/authentication/login_with_xbox',
+            { identityToken: `XBL3.0 x=${userHash};${xstsToken}` },
+            { 
+                headers: { 'Content-Type': 'application/json' },
+                validateStatus: () => true
+            }
+        );
+        
+        if (mcRes.status !== 200) {
+            console.log('❌ MC auth failed, using direct token');
+            return null;
+        }
+        
+        console.log('✅ Got Minecraft access token!');
+        return mcRes.data.access_token;
+        
+    } catch (err) {
+        console.error('Token conversion error:', err.message);
+        return null;
+    }
+}
+
 async function createBot(botId, host, port, sessionToken) {
     try {
         console.log(`[${botId}] Starting...`);
@@ -36,58 +93,49 @@ async function createBot(botId, host, port, sessionToken) {
         const tokenData = decodeJWT(accessToken);
         const mcProfile = tokenData.profiles?.mc || tokenData.pfd?.[0]?.id;
         const mcName = tokenData.pfd?.[0]?.name;
+        const xuid = tokenData.xuid;
         
         if (!mcName) throw new Error('No username in token');
         
         console.log(`[${botId}] Account: ${mcName}`);
         console.log(`[${botId}] UUID: ${mcProfile}`);
         
+        // Try to convert Xbox token to MC token
+        let finalToken = accessToken;
+        const mcToken = await xboxToMinecraft(accessToken, xuid);
+        if (mcToken) {
+            console.log(`[${botId}] ✅ Using converted Minecraft token`);
+            finalToken = mcToken;
+        } else {
+            console.log(`[${botId}] ⚠️ Using Xbox token directly`);
+        }
+        
+        console.log(`[${botId}] Connecting...`);
+        
         const client = mc.createClient({
             host: host,
             port: port,
             username: mcName,
-            auth: 'offline',
-            version: false,
-            skipValidation: true,
-            hideErrors: false
-        });
-        
-        // Session injection
-        client.on('session', (session) => {
-            console.log(`[${botId}] Session requested, injecting...`);
-            client.session = {
-                accessToken: accessToken,
-                clientToken: tokenData.xuid,
+            auth: 'microsoft', // Tell server we're Microsoft auth
+            session: {
+                accessToken: finalToken,
+                clientToken: xuid,
                 selectedProfile: {
                     id: mcProfile,
                     name: mcName
                 }
-            };
+            },
+            skipValidation: true,
+            version: false,
+            hideErrors: false
         });
         
-        const originalWrite = client.write.bind(client);
-        client.write = function(name, params) {
-            if (name === 'login_start' || name === 'encryption_begin') {
-                console.log(`[${botId}] Injecting session before ${name}`);
-                client.session = {
-                    accessToken: accessToken,
-                    clientToken: tokenData.xuid,
-                    selectedProfile: {
-                        id: mcProfile,
-                        name: mcName
-                    }
-                };
-            }
-            return originalWrite(name, params);
-        };
-        
         client.on('connect', () => {
-            console.log(`[${botId}] 🔌 Connected to server`);
+            console.log(`[${botId}] 🔌 Connected`);
         });
         
         client.on('error', (err) => {
             console.error(`[${botId}] ❌ Error: ${err.message}`);
-            console.error(`[${botId}] Stack: ${err.stack}`);
         });
         
         client.on('kick_disconnect', (packet) => {
@@ -103,43 +151,32 @@ async function createBot(botId, host, port, sessionToken) {
         client.on('disconnect', (packet) => {
             try {
                 const reason = JSON.parse(packet.reason);
-                console.log(`[${botId}] 🔌 DISCONNECT packet: ${reason.text || JSON.stringify(reason)}`);
+                console.log(`[${botId}] 🔌 DISCONNECT: ${reason.text || JSON.stringify(reason)}`);
             } catch {
-                console.log(`[${botId}] 🔌 DISCONNECT packet: ${JSON.stringify(packet)}`);
+                console.log(`[${botId}] 🔌 DISCONNECT`);
             }
             bots.delete(botId);
         });
         
         client.on('end', (reason) => {
-            console.log(`[${botId}] 🔌 Connection ended: ${reason || 'Unknown reason'}`);
+            console.log(`[${botId}] 🔌 Ended: ${reason || 'Unknown'}`);
             bots.delete(botId);
         });
         
-        client.on('login', (packet) => {
+        client.on('login', () => {
             console.log(`[${botId}] ✅✅✅ LOGGED IN! ✅✅✅`);
-            console.log(`[${botId}] Login packet:`, JSON.stringify(packet, null, 2));
         });
         
         client.on('spawn_position', () => {
-            console.log(`[${botId}] 🎮 SPAWNED IN GAME!`);
-        });
-        
-        client.on('position', (packet) => {
-            console.log(`[${botId}] 📍 Position update: ${JSON.stringify(packet)}`);
+            console.log(`[${botId}] 🎮 SPAWNED!`);
         });
         
         client.on('chat', (packet) => {
             try {
                 let text = typeof packet.message === 'string' ? JSON.parse(packet.message) : packet.message;
-                console.log(`[${botId}] 💬 Chat: ${extractText(text)}`);
+                const msg = extractText(text);
+                if (msg) console.log(`[${botId}] 💬 ${msg}`);
             } catch {}
-        });
-        
-        // Log ALL packets for debugging
-        client.on('packet', (data, metadata) => {
-            if (metadata.name !== 'keep_alive') { // Ignore keepalive spam
-                console.log(`[${botId}] 📦 Packet: ${metadata.name}`);
-            }
         });
         
         bots.set(botId, { client, mcName });
@@ -148,7 +185,6 @@ async function createBot(botId, host, port, sessionToken) {
         
     } catch (error) {
         console.error(`[${botId}] ❌ Failed: ${error.message}`);
-        console.error(error.stack);
         throw error;
     }
 }
