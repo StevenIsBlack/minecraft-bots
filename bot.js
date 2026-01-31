@@ -1,4 +1,4 @@
-const mc = require('minecraft-protocol');
+const mineflayer = require('mineflayer');
 const express = require('express');
 const app = express();
 
@@ -23,7 +23,6 @@ function decodeJWT(token) {
         if (parts.length !== 3) throw new Error('Invalid JWT structure');
         
         let payload = parts[1];
-        // Add padding if needed
         while (payload.length % 4 !== 0) payload += '=';
         
         return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
@@ -45,7 +44,6 @@ function parseName(text, myName) {
     
     try {
         let name = text.substring(0, text.indexOf(':')).trim();
-        // Remove color codes and brackets
         name = name.replace(/§./g, '').replace(/\[.*?\]/g, '').trim();
         if (name.endsWith('+')) name = name.substring(0, name.length - 1);
         if (name.includes(' ')) name = name.substring(name.lastIndexOf(' ') + 1);
@@ -73,161 +71,172 @@ function generateRandom() {
 
 async function createBot(botId, host, port, sessionToken) {
     try {
-        console.log(`[${botId}] Starting bot...`);
+        console.log(`\n[${botId}] Starting bot...`);
         
         const { email, accessToken } = parseToken(sessionToken);
-        console.log(`[${botId}] Parsed token for: ${email}`);
+        console.log(`[${botId}] Email: ${email}`);
         
-        // Decode the JWT to get Minecraft profile
+        // Decode the JWT
         const tokenData = decodeJWT(accessToken);
         
-        // Extract Minecraft profile from JWT
+        // Check what type of profile this is
+        console.log(`[${botId}] Checking token type...`);
+        
+        // Look for Java profile specifically
         const mcProfile = tokenData.profiles?.mc;
         const mcName = tokenData.pfd?.[0]?.name;
         
         if (!mcProfile || !mcName) {
-            throw new Error('Token missing Minecraft profile data. Token may be expired or invalid.');
+            throw new Error('Token missing Minecraft Java profile. This may be a Bedrock/Console-only account.');
         }
         
-        console.log(`[${botId}] Minecraft Username: ${mcName}`);
-        console.log(`[${botId}] UUID: ${mcProfile}`);
+        console.log(`[${botId}] Java Profile Found:`);
+        console.log(`[${botId}]   Username: ${mcName}`);
+        console.log(`[${botId}]   UUID: ${mcProfile}`);
         
-        // Check token expiration
+        // Check expiration
         const expiresAt = new Date(tokenData.exp * 1000);
-        const now = new Date();
-        
-        if (expiresAt < now) {
+        if (expiresAt < new Date()) {
             throw new Error(`Token expired at ${expiresAt.toISOString()}`);
         }
+        console.log(`[${botId}]   Expires: ${expiresAt.toISOString()}`);
         
-        console.log(`[${botId}] Token valid until: ${expiresAt.toISOString()}`);
-        console.log(`[${botId}] Connecting to ${host}:${port}...`);
+        // Check if this is an Xbox token (Bedrock indicator)
+        if (tokenData.xuid) {
+            console.log(`[${botId}] ⚠️  WARNING: Token contains XUID - may be Bedrock/Console token`);
+        }
         
-        // Create the Minecraft client with the session token
-        const client = mc.createClient({
+        console.log(`[${botId}] Connecting to ${host}:${port} as JAVA EDITION...`);
+        
+        // Use Mineflayer with STRICT Java authentication
+        const bot = mineflayer.createBot({
             host: host,
             port: port,
             username: email,
             auth: 'microsoft',
-            // Use the session directly - NO CONVERSION NEEDED!
+            // Force Java Edition session
             session: {
                 accessToken: accessToken,
                 clientToken: tokenData.aid || '00000000-0000-0000-0000-000000000000',
                 selectedProfile: {
                     id: mcProfile,
                     name: mcName
-                }
+                },
+                // Add profile array to ensure Java authentication
+                availableProfiles: [{
+                    id: mcProfile,
+                    name: mcName
+                }]
             },
             skipValidation: true,
-            version: false, // Auto-detect server version
-            hideErrors: false
+            version: false, // Let server dictate version
+            hideErrors: false,
+            // CRITICAL: These settings help ensure Java Edition
+            checkTimeoutInterval: 30000,
+            viewDistance: 'tiny'
         });
         
-        // Bot state
         const queue = [];
         const cooldown = new Set();
         let lastSend = 0;
         let isOnline = false;
+        let loginAttempts = 0;
         
-        client.on('login', () => {
-            console.log(`✅ [${botId}] Successfully logged in as ${mcName}`);
+        bot.on('login', () => {
+            loginAttempts++;
+            console.log(`✅ [${botId}] Login successful (attempt ${loginAttempts})`);
+            console.log(`✅ [${botId}] Connected as: ${bot.username}`);
             isOnline = true;
         });
         
-        client.on('spawn_position', (packet) => {
-            console.log(`🎮 [${botId}] Spawned at position`);
+        bot.on('spawn', () => {
+            console.log(`🎮 [${botId}] Spawned in game!`);
+            console.log(`🎮 [${botId}] Dimension: ${bot.game?.dimension || 'unknown'}`);
+            console.log(`🎮 [${botId}] Game mode: ${bot.game?.gameMode || 'unknown'}`);
+            
+            // Verify this is Java by checking dimension format
+            if (bot.game?.dimension) {
+                const dim = bot.game.dimension;
+                if (dim.includes('minecraft:') || dim === 'overworld' || dim === 'the_nether' || dim === 'the_end') {
+                    console.log(`✅ [${botId}] CONFIRMED: Java Edition (dimension: ${dim})`);
+                } else {
+                    console.log(`⚠️  [${botId}] WARNING: Unexpected dimension format: ${dim}`);
+                }
+            }
         });
         
-        // Message queue system
-        client.on('chat', (packet) => {
+        // Chat message handler
+        bot.on('message', (message) => {
             try {
-                let text = typeof packet.message === 'string' 
-                    ? JSON.parse(packet.message) 
-                    : packet.message;
-                    
-                const msg = extractText(text);
+                const msg = message.toString();
                 
-                // Ignore own messages and auto-messages
                 if (!msg || msg.includes('[AutoMsg]') || msg.includes('discord.gg')) {
                     return;
                 }
                 
-                const name = parseName(msg, mcName);
+                const name = parseName(msg, bot.username);
                 
                 if (name && !cooldown.has(name) && !queue.includes(name)) {
                     queue.push(name);
-                    console.log(`[${botId}] 📥 Queued: ${name} (${queue.length} in queue)`);
+                    console.log(`[${botId}] 📥 Queued: ${name} (${queue.length} total)`);
                 }
             } catch (e) {
-                // Ignore parse errors
+                // Ignore errors
             }
         });
         
         // Auto-message sender
         const sender = setInterval(() => {
-            if (!isOnline || !client.socket || !client.socket.writable) {
+            if (!isOnline || !bot.player) {
                 return;
             }
             
             const now = Date.now();
             
-            // Send message every 2 seconds if queue has players
             if (now - lastSend >= 2000 && queue.length > 0) {
                 const target = queue.shift();
                 const random = generateRandom();
                 const message = `/msg ${target} discord.gg\\bills cheapest market ${random}`;
                 
                 try {
-                    client.write('chat', { message });
+                    bot.chat(message);
                     console.log(`[${botId}] 📨 Sent to ${target} (${queue.length} remaining)`);
                     
                     lastSend = now;
                     cooldown.add(target);
-                    
-                    // Remove from cooldown after 5 seconds
                     setTimeout(() => cooldown.delete(target), 5000);
                 } catch (e) {
-                    console.error(`[${botId}] Failed to send message:`, e.message);
+                    console.error(`[${botId}] Send failed:`, e.message);
                 }
             }
         }, 100);
         
-        client.on('kick_disconnect', (packet) => {
+        bot.on('kicked', (reason) => {
             clearInterval(sender);
-            try {
-                const reason = JSON.parse(packet.reason);
-                console.error(`🚫 [${botId}] Kicked: ${reason.text || 'Unknown reason'}`);
-            } catch {
-                console.error(`🚫 [${botId}] Kicked from server`);
+            console.error(`🚫 [${botId}] Kicked: ${reason}`);
+            
+            // Check if kicked for being already online (good sign - means Java works)
+            if (reason.includes('already online')) {
+                console.log(`✅ [${botId}] Account is valid Java Edition (kicked for duplicate login)`);
             }
+            
             bots.delete(botId);
         });
         
-        client.on('disconnect', (packet) => {
-            clearInterval(sender);
-            try {
-                const reason = JSON.parse(packet.reason);
-                console.log(`[${botId}] Disconnected: ${reason.text || 'Connection closed'}`);
-            } catch {
-                console.log(`[${botId}] Disconnected`);
-            }
-            bots.delete(botId);
-        });
-        
-        client.on('end', () => {
+        bot.on('end', (reason) => {
             clearInterval(sender);
             isOnline = false;
-            console.log(`[${botId}] Connection ended`);
+            console.log(`[${botId}] Connection ended: ${reason || 'unknown'}`);
             bots.delete(botId);
         });
         
-        client.on('error', (err) => {
+        bot.on('error', (err) => {
             console.error(`❌ [${botId}] Error: ${err.message}`);
         });
         
-        // Store bot info
+        // Store bot
         bots.set(botId, { 
-            client, 
+            bot,
             mcName, 
             uuid: mcProfile,
             queue, 
@@ -242,7 +251,7 @@ async function createBot(botId, host, port, sessionToken) {
         };
         
     } catch (error) {
-        console.error(`❌ [${botId}] Failed to create bot: ${error.message}`);
+        console.error(`❌ [${botId}] Failed: ${error.message}`);
         throw error;
     }
 }
@@ -266,60 +275,37 @@ app.post('/add', async (req, res) => {
             });
         }
         
-        console.log(`\n[API] Starting bot: ${username}`);
         const result = await createBot(username, host, port, token);
-        
-        res.json({ 
-            success: true, 
-            message: `Bot ${username} started`,
-            ...result 
-        });
+        res.json({ success: true, ...result });
         
     } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
 app.post('/remove', (req, res) => {
     const { username } = req.body;
+    const botData = bots.get(username);
     
-    if (!username) {
-        return res.status(400).json({ success: false, error: 'Missing username' });
-    }
-    
-    const bot = bots.get(username);
-    if (!bot) {
+    if (!botData) {
         return res.status(404).json({ success: false, error: 'Bot not found' });
     }
     
-    console.log(`[API] Stopping bot: ${username}`);
-    bot.client.end('Stopped via API');
+    botData.bot.quit('Stopped via API');
     bots.delete(username);
-    
-    res.json({ success: true, message: `Bot ${username} stopped` });
+    res.json({ success: true });
 });
 
 app.post('/chat', (req, res) => {
     const { username, message } = req.body;
+    const botData = bots.get(username);
     
-    if (!username || !message) {
-        return res.status(400).json({ 
-            success: false, 
-            error: 'Missing username or message' 
-        });
-    }
-    
-    const bot = bots.get(username);
-    if (!bot) {
+    if (!botData) {
         return res.status(404).json({ success: false, error: 'Bot not found' });
     }
     
     try {
-        bot.client.write('chat', { message });
-        console.log(`[API] Chat from ${username}: ${message}`);
+        botData.bot.chat(message);
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -328,16 +314,9 @@ app.post('/chat', (req, res) => {
 
 app.post('/forcemsg', (req, res) => {
     const { username, target } = req.body;
+    const botData = bots.get(username);
     
-    if (!username || !target) {
-        return res.status(400).json({ 
-            success: false, 
-            error: 'Missing username or target' 
-        });
-    }
-    
-    const bot = bots.get(username);
-    if (!bot) {
+    if (!botData) {
         return res.status(404).json({ success: false, error: 'Bot not found' });
     }
     
@@ -346,10 +325,10 @@ app.post('/forcemsg', (req, res) => {
         const message = `/msg ${target} discord.gg\\bills cheapest market ${random}`;
         
         try {
-            bot.client.write('chat', { message });
-            console.log(`[${username}] 🎯 Force message sent to ${target}`);
+            botData.bot.chat(message);
+            console.log(`[${username}] 🎯 Force sent to ${target}`);
         } catch (err) {
-            console.error(`[${username}] Failed to send force message:`, err.message);
+            console.error(`[${username}] Force send failed`);
         }
     }, 1000);
     
@@ -357,40 +336,33 @@ app.post('/forcemsg', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-    const status = Array.from(bots.entries()).map(([username, bot]) => ({
+    const status = Array.from(bots.entries()).map(([username, botData]) => ({
         username,
-        mcUsername: bot.mcName,
-        uuid: bot.uuid,
-        connected: bot.client.socket?.writable || false,
-        queueLength: bot.queue.length,
-        cooldownCount: bot.cooldown.size,
-        uptime: Math.floor((Date.now() - bot.startTime) / 1000)
+        mcUsername: botData.mcName,
+        uuid: botData.uuid,
+        connected: botData.bot.player !== null && botData.bot.player !== undefined,
+        health: botData.bot.health || 0,
+        food: botData.bot.food || 0,
+        queueLength: botData.queue.length,
+        cooldownCount: botData.cooldown.size,
+        uptime: Math.floor((Date.now() - botData.startTime) / 1000)
     }));
     
-    res.json({ 
-        success: true, 
-        count: bots.size, 
-        bots: status 
-    });
+    res.json({ success: true, count: bots.size, bots: status });
 });
 
 app.get('/', (req, res) => {
-    res.json({ 
-        status: 'online', 
-        bots: bots.size,
-        uptime: process.uptime()
-    });
+    res.json({ status: 'online', bots: bots.size });
 });
 
 app.get('/health', (req, res) => {
     res.json({ healthy: true, bots: bots.size });
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-    console.log('\n🛑 SIGTERM received, shutting down...');
-    bots.forEach((bot, username) => {
-        bot.client.end('Server shutting down');
+    console.log('\n🛑 Shutting down...');
+    bots.forEach((botData) => {
+        botData.bot.quit('Server shutdown');
     });
     process.exit(0);
 });
@@ -398,8 +370,8 @@ process.on('SIGTERM', () => {
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
     console.log('=================================');
-    console.log('🚀 Minecraft Bot Manager v2.0');
+    console.log('🚀 Minecraft Bot Manager v3.0');
+    console.log('📡 JAVA EDITION ONLY');
     console.log(`✅ Running on port ${PORT}`);
-    console.log(`📡 Ready for connections`);
     console.log('=================================');
 });
