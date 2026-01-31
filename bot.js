@@ -1,18 +1,10 @@
-const mineflayer = require('mineflayer');
-const { Authflow, Titles } = require('prismarine-auth');
+const mc = require('minecraft-protocol');
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
 const app = express();
 
 app.use(express.json());
 
 const bots = new Map();
-const CACHE_DIR = './.minecraft-cache';
-
-if (!fs.existsSync(CACHE_DIR)) {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
 
 function parseToken(tokenString) {
     const parts = tokenString.split(':');
@@ -28,7 +20,7 @@ function decodeJWT(token) {
     try {
         token = token.trim();
         const parts = token.split('.');
-        if (parts.length !== 3) throw new Error('Invalid JWT structure');
+        if (parts.length !== 3) throw new Error('Invalid JWT');
         
         let payload = parts[1];
         while (payload.length % 4 !== 0) payload += '=';
@@ -90,90 +82,39 @@ async function createBot(botId, host, port, sessionToken) {
         const mcName = tokenData.pfd?.[0]?.name;
         
         if (!mcProfile || !mcName) {
-            throw new Error('Token missing Minecraft Java profile');
+            throw new Error('Missing Java profile in token');
         }
         
-        console.log(`[${botId}] Java Profile Found:`);
-        console.log(`[${botId}]   Username: ${mcName}`);
-        console.log(`[${botId}]   UUID: ${mcProfile}`);
+        console.log(`[${botId}] Username: ${mcName}`);
+        console.log(`[${botId}] UUID: ${mcProfile}`);
         
         const expiresAt = new Date(tokenData.exp * 1000);
         if (expiresAt < new Date()) {
-            throw new Error(`Token expired at ${expiresAt.toISOString()}`);
+            throw new Error('Token expired');
         }
-        console.log(`[${botId}]   Expires: ${expiresAt.toISOString()}`);
-        
-        // Create cache file for this account
-        const cacheFile = path.join(CACHE_DIR, `${email.replace('@', '_at_')}.json`);
-        
-        // Write cached authentication data
-        const authCache = {
-            userCache: {
-                [email]: {
-                    properties: [],
-                    id: mcProfile,
-                    name: mcName,
-                    type: 'msa'
-                }
-            },
-            selectedUserKey: email,
-            msa: {
-                token: accessToken,
-                refresh_token: '',
-                obtainedOn: Date.now(),
-                expiresOn: tokenData.exp * 1000
-            },
-            xbl: {
-                userHash: tokenData.sub || '',
-                XSTSToken: accessToken,
-                expiresOn: tokenData.exp * 1000
-            },
-            mca: {
-                token: accessToken,
-                obtainedOn: Date.now(),
-                expiresOn: tokenData.exp * 1000,
-                profile: {
-                    id: mcProfile,
-                    name: mcName
-                }
-            }
-        };
-        
-        fs.writeFileSync(cacheFile, JSON.stringify(authCache, null, 2));
-        console.log(`[${botId}] Created auth cache at ${cacheFile}`);
         
         console.log(`[${botId}] Connecting to ${host}:${port}...`);
         
-        // Create authflow with cached data
-        const authflow = new Authflow(email, CACHE_DIR, {
-            authTitle: Titles.MinecraftJava,
-            deviceType: 'Win32',
-            flow: 'live',
-            password: undefined // Prevent password prompts
-        });
-        
-        // Inject our cached token into authflow
-        authflow.mca = {
-            token: accessToken,
-            obtainedOn: Date.now(),
-            expiresOn: tokenData.exp * 1000,
-            profile: {
-                id: mcProfile,
-                name: mcName
-            }
-        };
-        
-        const bot = mineflayer.createBot({
+        // Use minecraft-protocol with explicit session and NO auth
+        const client = mc.createClient({
             host: host,
             port: port,
-            username: email,
-            auth: 'microsoft',
-            authflow: authflow,
-            profilesFolder: CACHE_DIR,
+            // CRITICAL: Use the MC username, not email
+            username: mcName,
+            // CRITICAL: Set auth to false to prevent any authentication
+            auth: false,
+            // Provide session for encryption
+            session: {
+                accessToken: accessToken,
+                clientToken: tokenData.aid || 'nodejs',
+                selectedProfile: {
+                    id: mcProfile,
+                    name: mcName
+                }
+            },
+            // Force Java protocol
             version: false,
-            hideErrors: false,
-            checkTimeoutInterval: 30000,
-            viewDistance: 'tiny'
+            hideErrors: false
         });
         
         const queue = [];
@@ -181,36 +122,39 @@ async function createBot(botId, host, port, sessionToken) {
         let lastSend = 0;
         let isOnline = false;
         
-        bot.on('login', () => {
-            console.log(`✅ [${botId}] Login successful!`);
-            console.log(`✅ [${botId}] Username: ${bot.username}`);
+        client.on('success', () => {
+            console.log(`✅ [${botId}] Authentication successful!`);
+        });
+        
+        client.on('login', (packet) => {
+            console.log(`✅ [${botId}] Logged in!`);
+            console.log(`✅ [${botId}] Entity ID: ${packet.entityId}`);
             isOnline = true;
         });
         
-        bot.on('spawn', () => {
-            console.log(`🎮 [${botId}] Spawned!`);
-            console.log(`🎮 [${botId}] Health: ${bot.health}, Food: ${bot.food}`);
+        client.on('spawn_position', () => {
+            console.log(`🎮 [${botId}] Spawned in game!`);
         });
         
-        bot.on('message', (message) => {
+        client.on('chat', (packet) => {
             try {
-                const msg = message.toString();
+                let text = typeof packet.message === 'string' ? JSON.parse(packet.message) : packet.message;
+                const msg = extractText(text);
                 
                 if (!msg || msg.includes('[AutoMsg]') || msg.includes('discord.gg')) {
                     return;
                 }
                 
-                const name = parseName(msg, bot.username);
-                
+                const name = parseName(msg, mcName);
                 if (name && !cooldown.has(name) && !queue.includes(name)) {
                     queue.push(name);
                     console.log(`[${botId}] 📥 Queued: ${name}`);
                 }
-            } catch (e) {}
+            } catch {}
         });
         
         const sender = setInterval(() => {
-            if (!isOnline || !bot.player) return;
+            if (!isOnline || !client.socket || !client.socket.writable) return;
             
             const now = Date.now();
             
@@ -220,40 +164,50 @@ async function createBot(botId, host, port, sessionToken) {
                 const message = `/msg ${target} discord.gg\\bills cheapest market ${random}`;
                 
                 try {
-                    bot.chat(message);
+                    client.write('chat', { message });
                     console.log(`[${botId}] 📨 → ${target}`);
                     
                     lastSend = now;
                     cooldown.add(target);
                     setTimeout(() => cooldown.delete(target), 5000);
-                } catch (e) {}
+                } catch {}
             }
         }, 100);
         
-        bot.on('kicked', (reason) => {
+        client.on('kick_disconnect', (packet) => {
             clearInterval(sender);
-            console.error(`🚫 [${botId}] Kicked: ${reason}`);
+            try {
+                const reason = JSON.parse(packet.reason);
+                console.error(`🚫 [${botId}] Kicked: ${reason.text || reason}`);
+            } catch {
+                console.error(`🚫 [${botId}] Kicked: ${packet.reason}`);
+            }
             bots.delete(botId);
         });
         
-        bot.on('end', () => {
+        client.on('disconnect', (packet) => {
+            clearInterval(sender);
+            try {
+                const reason = JSON.parse(packet.reason);
+                console.log(`[${botId}] Disconnected: ${reason.text || reason}`);
+            } catch {
+                console.log(`[${botId}] Disconnected`);
+            }
+            bots.delete(botId);
+        });
+        
+        client.on('end', () => {
             clearInterval(sender);
             isOnline = false;
+            console.log(`[${botId}] Connection ended`);
             bots.delete(botId);
         });
         
-        bot.on('error', (err) => {
+        client.on('error', (err) => {
             console.error(`❌ [${botId}] ${err.message}`);
         });
         
-        bots.set(botId, { 
-            bot,
-            mcName, 
-            uuid: mcProfile,
-            queue, 
-            cooldown,
-            startTime: Date.now()
-        });
+        bots.set(botId, { client, mcName, queue, cooldown });
         
         return { success: true, mcUsername: mcName, uuid: mcProfile };
         
@@ -285,53 +239,57 @@ app.post('/add', async (req, res) => {
 
 app.post('/remove', (req, res) => {
     const { username } = req.body;
-    const botData = bots.get(username);
+    const bot = bots.get(username);
     
-    if (!botData) {
+    if (!bot) {
         return res.status(404).json({ success: false, error: 'Not found' });
     }
     
-    botData.bot.quit();
+    bot.client.end();
     bots.delete(username);
     res.json({ success: true });
 });
 
 app.post('/chat', (req, res) => {
     const { username, message } = req.body;
-    const botData = bots.get(username);
+    const bot = bots.get(username);
     
-    if (!botData) {
+    if (!bot) {
         return res.status(404).json({ success: false, error: 'Not found' });
     }
     
-    botData.bot.chat(message);
+    bot.client.write('chat', { message });
     res.json({ success: true });
 });
 
 app.post('/forcemsg', (req, res) => {
     const { username, target } = req.body;
-    const botData = bots.get(username);
+    const bot = bots.get(username);
     
-    if (!botData) {
+    if (!bot) {
         return res.status(404).json({ success: false, error: 'Not found' });
     }
     
     setTimeout(() => {
         const random = generateRandom();
         const message = `/msg ${target} discord.gg\\bills cheapest market ${random}`;
-        botData.bot.chat(message);
+        
+        try {
+            bot.client.write('chat', { message });
+            console.log(`[${username}] 🎯 Force → ${target}`);
+        } catch {}
     }, 1000);
     
     res.json({ success: true });
 });
 
 app.get('/status', (req, res) => {
-    const status = Array.from(bots.entries()).map(([username, botData]) => ({
+    const status = Array.from(bots.entries()).map(([username, bot]) => ({
         username,
-        mcUsername: botData.mcName,
-        connected: !!botData.bot.player,
-        health: botData.bot.health || 0,
-        queueLength: botData.queue.length
+        mcUsername: bot.mcName,
+        connected: bot.client.socket?.writable || false,
+        queueLength: bot.queue.length,
+        cooldownCount: bot.cooldown.size
     }));
     
     res.json({ success: true, count: bots.size, bots: status });
@@ -341,14 +299,15 @@ app.get('/', (req, res) => res.json({ status: 'online', bots: bots.size }));
 app.get('/health', (req, res) => res.json({ healthy: true }));
 
 process.on('SIGTERM', () => {
-    bots.forEach((botData) => botData.bot.quit());
+    bots.forEach((bot) => bot.client.end());
     process.exit(0);
 });
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
     console.log('=================================');
-    console.log('🚀 Bot Manager v5.0 - CACHED AUTH');
+    console.log('🚀 Bot Manager v6.0');
+    console.log('🔧 NO AUTH MODE (Direct session)');
     console.log(`✅ Port ${PORT}`);
     console.log('=================================');
 });
