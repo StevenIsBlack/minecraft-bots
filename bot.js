@@ -274,6 +274,8 @@ app.post('/chat', (req, res) => {
     res.json({ success: true });
 });
 
+// In the bot.js, update the forcemsg endpoint:
+
 app.post('/forcemsg', (req, res) => {
     const { username, target } = req.body;
     if (!username || !target) return res.status(400).json({ success: false, error: 'Missing data' });
@@ -281,16 +283,20 @@ app.post('/forcemsg', (req, res) => {
     const bot = bots.get(username);
     if (!bot) return res.status(404).json({ success: false, error: 'Bot not found' });
     
-    const random = generateRandom();
-    const message = `/msg ${target} discord.gg\\bills cheapest market ${random}`;
+    // Add a small delay to look less like a bot
+    setTimeout(() => {
+        const random = generateRandom();
+        const message = `/msg ${target} discord.gg\\bills cheapest market ${random}`;
+        
+        try {
+            bot.client.write('chat', { message });
+            console.log(`[${username}] 🎯 Force sent to ${target}`);
+        } catch (err) {
+            console.error(`[${username}] Send failed: ${err.message}`);
+        }
+    }, 500); // 500ms delay
     
-    try {
-        bot.client.write('chat', { message });
-        console.log(`[${username}] 🎯 Force sent to ${target}`);
-        res.json({ success: true, message: `Sent to ${target}` });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
+    res.json({ success: true, message: `Sending to ${target}` });
 });
 
 app.get('/status', (req, res) => {
