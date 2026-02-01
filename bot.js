@@ -1,20 +1,11 @@
-const mc = require('minecraft-protocol');
+const mineflayer = require('mineflayer');
 const express = require('express');
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 const { SocksClient } = require('socks');
 const app = express();
 
 app.use(express.json());
 
 const bots = new Map();
-const CACHE_DIR = './auth_cache';
-
-if (!fs.existsSync(CACHE_DIR)) {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
-
 const PROXIES = (process.env.PROXY_LIST || '').split(',').filter(p => p.trim());
 
 function getRandomProxy() {
@@ -35,82 +26,6 @@ function parseProxy(proxyString) {
     } catch {
         const [host, port] = proxyString.split(':');
         return { type: 5, host, port: parseInt(port) || 1080 };
-    }
-}
-
-function parseToken(tokenString) {
-    const parts = tokenString.split(':');
-    if (parts.length < 3) throw new Error('Invalid format');
-    return {
-        email: parts[0],
-        password: parts[1],
-        accessToken: parts.slice(2).join(':')
-    };
-}
-
-function decodeJWT(token) {
-    try {
-        token = token.trim();
-        const parts = token.split('.');
-        let payload = parts[1];
-        while (payload.length % 4 !== 0) payload += '=';
-        return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
-    } catch (e) {
-        throw new Error('JWT decode failed');
-    }
-}
-
-async function xboxToMinecraftJava(xboxToken) {
-    try {
-        console.log('🔄 Converting to JAVA token...');
-        
-        const xstsRes = await axios.post('https://xsts.auth.xboxlive.com/xsts/authorize', {
-            Properties: { SandboxId: 'RETAIL', UserTokens: [xboxToken] },
-            RelyingParty: 'rp://api.minecraftservices.com/',
-            TokenType: 'JWT'
-        }, {
-            headers: { 'Content-Type': 'application/json', 'x-xbl-contract-version': '1' },
-            validateStatus: () => true
-        });
-        
-        if (xstsRes.status !== 200) {
-            console.log('❌ XSTS failed');
-            return null;
-        }
-        
-        const xstsToken = xstsRes.data.Token;
-        const userHash = xstsRes.data.DisplayClaims.xui[0].uhs;
-        
-        const mcRes = await axios.post(
-            'https://api.minecraftservices.com/authentication/login_with_xbox',
-            { identityToken: `XBL3.0 x=${userHash};${xstsToken}` },
-            { headers: { 'Content-Type': 'application/json' }, validateStatus: () => true }
-        );
-        
-        if (mcRes.status !== 200) {
-            console.log('❌ MC auth failed');
-            return null;
-        }
-        
-        const profileRes = await axios.get(
-            'https://api.minecraftservices.com/minecraft/profile',
-            { headers: { 'Authorization': `Bearer ${mcRes.data.access_token}` }, validateStatus: () => true }
-        );
-        
-        if (profileRes.status !== 200) {
-            console.log('❌ No Java profile');
-            return null;
-        }
-        
-        console.log('✅ JAVA profile:', profileRes.data.name);
-        
-        return {
-            accessToken: mcRes.data.access_token,
-            profile: profileRes.data
-        };
-    } catch (err) {
-        console.error('Token error:', err.message);
-        return null;
     }
 }
 
@@ -148,22 +63,9 @@ function generateRandom() {
     return result;
 }
 
-async function createBot(botId, host, port, sessionToken, proxyString = null) {
+async function createBot(botId, host, port, alteningToken, proxyString = null) {
     try {
-        console.log(`[${botId}] Starting...`);
-        const { email, accessToken } = parseToken(sessionToken);
-        
-        const javaAuth = await xboxToMinecraftJava(accessToken);
-        
-        if (!javaAuth) {
-            throw new Error('Cannot convert to Java token');
-        }
-        
-        const mcName = javaAuth.profile.name;
-        const mcProfile = javaAuth.profile.id;
-        const tokenData = decodeJWT(accessToken);
-        
-        console.log(`[${botId}] ✅ JAVA: ${mcName}`);
+        console.log(`[${botId}] Starting with TheAltening token...`);
         
         let proxy = null;
         if (proxyString) {
@@ -180,14 +82,10 @@ async function createBot(botId, host, port, sessionToken, proxyString = null) {
         const clientOptions = {
             host: host,
             port: port,
-            username: mcName,
-            auth: 'microsoft',
-            session: {
-                accessToken: javaAuth.accessToken,
-                clientToken: tokenData.xuid || tokenData.aid,
-                selectedProfile: { id: mcProfile, name: mcName }
-            },
-            skipValidation: true,
+            username: alteningToken, // TheAltening uses token as username
+            auth: 'microsoft', // TheAltening requires Microsoft auth mode
+            authServer: 'http://authserver.thealtening.com', // TheAltening auth server
+            sessionServer: 'http://sessionserver.thealtening.com', // TheAltening session server
             version: false,
             hideErrors: false
         };
@@ -208,76 +106,67 @@ async function createBot(botId, host, port, sessionToken, proxyString = null) {
             };
         }
         
-        console.log(`[${botId}] Connecting...`);
-        const client = mc.createClient(clientOptions);
+        console.log(`[${botId}] Connecting to ${host}:${port}...`);
+        const client = mineflayer.createBot(clientOptions);
         
         const queue = [];
         const cooldown = new Set();
         let lastSend = 0;
         let isOnline = false;
+        let mcUsername = alteningToken;
         
         client.on('login', () => {
-            console.log(`[${botId}] ✅ LOGGED IN!`);
+            mcUsername = client.username || alteningToken;
+            console.log(`[${botId}] ✅ LOGGED IN as ${mcUsername}!`);
             isOnline = true;
         });
         
-        client.on('spawn_position', () => {
+        client.on('spawn', () => {
             console.log(`[${botId}] 🎮 SPAWNED!`);
         });
         
-        client.on('chat', (packet) => {
-            try {
-                let text = typeof packet.message === 'string' ? JSON.parse(packet.message) : packet.message;
-                const msg = extractText(text);
-                
-                if (!msg || msg.includes('[AutoMsg]') || msg.includes('discord.gg')) return;
-                
-                const name = parseName(msg, mcName);
-                if (name && !cooldown.has(name) && !queue.includes(name)) {
-                    queue.push(name);
-                    console.log(`[${botId}] 📥 Queued: ${name}`);
-                }
-            } catch {}
+        client.on('messagestr', (message) => {
+            console.log(`[${botId}] 💬 ${message}`);
+            
+            if (message.includes('[AutoMsg]') || message.includes('discord.gg')) return;
+            
+            const name = parseName(message, mcUsername);
+            if (name && !cooldown.has(name) && !queue.includes(name)) {
+                queue.push(name);
+                console.log(`[${botId}] 📥 Queued: ${name} (Total: ${queue.length})`);
+            }
         });
         
         const sender = setInterval(() => {
-            if (!isOnline || !client.socket || !client.socket.writable) return;
+            if (!isOnline || !client._client || !client._client.socket) return;
             
             const now = Date.now();
             if (now - lastSend >= 2000 && queue.length > 0) {
                 const target = queue.shift();
                 const random = generateRandom();
-                const message = `/msg ${target} discord.gg\\bills cheapest market ${random}`;
                 
                 try {
-                    client.write('chat', { message });
-                    console.log(`[${botId}] 📨 Sent to ${target}`);
+                    client.chat(`/msg ${target} discord.gg\\bills cheapest market ${random}`);
+                    console.log(`[${botId}] 📨 Sent to ${target} (Queue: ${queue.length})`);
                     
                     lastSend = now;
                     cooldown.add(target);
                     setTimeout(() => cooldown.delete(target), 5000);
-                } catch {}
+                } catch (err) {
+                    console.error(`[${botId}] Send failed: ${err.message}`);
+                }
             }
         }, 100);
         
-        client.on('kick_disconnect', (packet) => {
+        client.on('kicked', (reason) => {
             clearInterval(sender);
-            try {
-                const reason = JSON.parse(packet.reason);
-                console.error(`[${botId}] 🚫 KICKED: ${reason.text || JSON.stringify(reason)}`);
-            } catch {
-                console.error(`[${botId}] 🚫 KICKED`);
-            }
-            bots.delete(botId);
-        });
-        
-        client.on('disconnect', (packet) => {
-            clearInterval(sender);
+            console.error(`[${botId}] 🚫 KICKED: ${reason}`);
             bots.delete(botId);
         });
         
         client.on('end', () => {
             clearInterval(sender);
+            console.log(`[${botId}] 🔌 Ended`);
             isOnline = false;
             bots.delete(botId);
         });
@@ -286,9 +175,19 @@ async function createBot(botId, host, port, sessionToken, proxyString = null) {
             console.error(`[${botId}] ❌ ${err.message}`);
         });
         
-        bots.set(botId, { client, mcName, queue, cooldown, proxy: proxy ? `${proxy.host}:${proxy.port}` : 'None' });
+        bots.set(botId, { 
+            client, 
+            mcUsername, 
+            queue, 
+            cooldown, 
+            proxy: proxy ? `${proxy.host}:${proxy.port}` : 'None' 
+        });
         
-        return { success: true, mcUsername: mcName, uuid: mcProfile, proxy: proxy ? `${proxy.host}:${proxy.port}` : 'Direct' };
+        return { 
+            success: true, 
+            mcUsername: mcUsername, 
+            proxy: proxy ? `${proxy.host}:${proxy.port}` : 'Direct' 
+        };
         
     } catch (error) {
         console.error(`[${botId}] ❌ ${error.message}`);
@@ -322,7 +221,7 @@ app.post('/chat', (req, res) => {
     const { username, message } = req.body;
     const bot = bots.get(username);
     if (!bot) return res.status(404).json({ success: false, error: 'Not found' });
-    bot.client.write('chat', { message });
+    bot.client.chat(message);
     res.json({ success: true });
 });
 
@@ -336,7 +235,7 @@ app.post('/forcemsg', (req, res) => {
     setTimeout(() => {
         const message = `/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`;
         try {
-            bot.client.write('chat', { message });
+            bot.client.chat(message);
             console.log(`[${username}] 🎯 Force sent to ${target}`);
         } catch (err) {
             console.error(`[${username}] Send failed`);
@@ -349,8 +248,8 @@ app.post('/forcemsg', (req, res) => {
 app.get('/status', (req, res) => {
     const status = Array.from(bots.entries()).map(([username, bot]) => ({
         username,
-        mcUsername: bot.mcName,
-        connected: bot.client.socket?.writable || false,
+        mcUsername: bot.mcUsername,
+        connected: bot.client._client?.socket?.writable || false,
         queue: bot.queue.length,
         cooldowns: bot.cooldown.size,
         proxy: bot.proxy
@@ -365,4 +264,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`✅ Running on ${PORT}`);
     console.log(`🌐 Proxies: ${PROXIES.length}`);
+    console.log(`🔑 TheAltening Mode: ENABLED`);
 });
