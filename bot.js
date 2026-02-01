@@ -6,6 +6,7 @@ const app = express();
 app.use(express.json());
 
 const bots = new Map();
+const bannedAccounts = new Set(); // Track banned accounts
 const PROXIES = (process.env.PROXY_LIST || '').split(',').filter(p => p.trim());
 
 function getRandomProxy() {
@@ -63,9 +64,18 @@ function generateRandom() {
     return result;
 }
 
-async function createBot(botId, host, port, alteningToken, proxyString = null) {
+async function createBot(botId, host, port, alteningToken, proxyString = null, isReconnect = false) {
     try {
-        console.log(`[${botId}] Starting with TheAltening token...`);
+        if (bannedAccounts.has(botId)) {
+            console.log(`[${botId}] ⛔ Account is banned, not reconnecting`);
+            return { success: false, error: 'Account is banned' };
+        }
+
+        if (!isReconnect) {
+            console.log(`[${botId}] 🚀 Starting with TheAltening token...`);
+        } else {
+            console.log(`[${botId}] 🔄 Reconnecting...`);
+        }
         
         let proxy = null;
         if (proxyString) {
@@ -75,17 +85,15 @@ async function createBot(botId, host, port, alteningToken, proxyString = null) {
             const randomProxy = getRandomProxy();
             proxy = parseProxy(randomProxy);
             console.log(`[${botId}] 🌐 Auto-proxy: ${proxy.host}:${proxy.port}`);
-        } else {
-            console.log(`[${botId}] ⚠️  No proxy`);
         }
         
         const clientOptions = {
             host: host,
             port: port,
-            username: alteningToken, // TheAltening uses token as username
-            auth: 'microsoft', // TheAltening requires Microsoft auth mode
-            authServer: 'http://authserver.thealtening.com', // TheAltening auth server
-            sessionServer: 'http://sessionserver.thealtening.com', // TheAltening session server
+            username: alteningToken,
+            auth: 'microsoft',
+            authServer: 'http://authserver.thealtening.com',
+            sessionServer: 'http://sessionserver.thealtening.com',
             version: false,
             hideErrors: false
         };
@@ -100,13 +108,13 @@ async function createBot(botId, host, port, alteningToken, proxyString = null) {
                     client.setSocket(info.socket);
                     client.emit('connect');
                 }).catch(err => {
-                    console.error(`[${botId}] Proxy failed: ${err.message}`);
+                    console.error(`[${botId}] 🌐❌ Proxy failed: ${err.message}`);
                     client.emit('error', err);
                 });
             };
         }
         
-        console.log(`[${botId}] Connecting to ${host}:${port}...`);
+        console.log(`[${botId}] 🔌 Connecting to ${host}:${port}...`);
         const client = mineflayer.createBot(clientOptions);
         
         const queue = [];
@@ -114,11 +122,30 @@ async function createBot(botId, host, port, alteningToken, proxyString = null) {
         let lastSend = 0;
         let isOnline = false;
         let mcUsername = alteningToken;
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 5;
+        
+        // Store bot data
+        const botData = {
+            client,
+            mcUsername,
+            queue,
+            cooldown,
+            proxy: proxy ? `${proxy.host}:${proxy.port}` : 'None',
+            token: alteningToken,
+            host,
+            port,
+            proxyString,
+            isOnline: false
+        };
         
         client.on('login', () => {
             mcUsername = client.username || alteningToken;
+            botData.mcUsername = mcUsername;
             console.log(`[${botId}] ✅ LOGGED IN as ${mcUsername}!`);
             isOnline = true;
+            botData.isOnline = true;
+            reconnectAttempts = 0; // Reset on successful login
         });
         
         client.on('spawn', () => {
@@ -126,8 +153,6 @@ async function createBot(botId, host, port, alteningToken, proxyString = null) {
         });
         
         client.on('messagestr', (message) => {
-            console.log(`[${botId}] 💬 ${message}`);
-            
             if (message.includes('[AutoMsg]') || message.includes('discord.gg')) return;
             
             const name = parseName(message, mcUsername);
@@ -153,35 +178,69 @@ async function createBot(botId, host, port, alteningToken, proxyString = null) {
                     cooldown.add(target);
                     setTimeout(() => cooldown.delete(target), 5000);
                 } catch (err) {
-                    console.error(`[${botId}] Send failed: ${err.message}`);
+                    console.error(`[${botId}] ❌ Send failed: ${err.message}`);
                 }
             }
         }, 100);
         
         client.on('kicked', (reason) => {
             clearInterval(sender);
-            console.error(`[${botId}] 🚫 KICKED: ${reason}`);
-            bots.delete(botId);
+            console.error(`[${botId}] 🚫 KICKED FROM SERVER!`);
+            console.error(`[${botId}] 📋 Kick Reason: ${reason}`);
+            
+            // Check if banned
+            const reasonLower = reason.toLowerCase();
+            if (reasonLower.includes('ban') || 
+                reasonLower.includes('banned') || 
+                reasonLower.includes('blacklist') ||
+                reasonLower.includes('permanent')) {
+                
+                console.error(`[${botId}] ⛔ DETECTED AS BANNED - Will not reconnect`);
+                bannedAccounts.add(botId);
+                bots.delete(botId);
+                botData.isOnline = false;
+                return;
+            }
+            
+            // Auto-reconnect if not banned
+            console.log(`[${botId}] 🔄 Not banned, attempting reconnect in 10 seconds...`);
+            botData.isOnline = false;
+            
+            setTimeout(() => {
+                if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                    reconnectAttempts++;
+                    console.log(`[${botId}] 🔄 Reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+                    createBot(botId, host, port, alteningToken, proxyString, true);
+                } else {
+                    console.error(`[${botId}] ⛔ Max reconnect attempts reached, giving up`);
+                    bots.delete(botId);
+                }
+            }, 10000);
         });
         
         client.on('end', () => {
             clearInterval(sender);
-            console.log(`[${botId}] 🔌 Ended`);
+            console.log(`[${botId}] 🔌 Connection ended`);
             isOnline = false;
-            bots.delete(botId);
+            botData.isOnline = false;
+            
+            // Auto-reconnect on unexpected disconnect (if not banned)
+            if (!bannedAccounts.has(botId)) {
+                setTimeout(() => {
+                    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                        reconnectAttempts++;
+                        console.log(`[${botId}] 🔄 Auto-reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+                        createBot(botId, host, port, alteningToken, proxyString, true);
+                    }
+                }, 10000);
+            }
         });
         
         client.on('error', (err) => {
-            console.error(`[${botId}] ❌ ${err.message}`);
+            console.error(`[${botId}] ❌ Error: ${err.message}`);
         });
         
-        bots.set(botId, { 
-            client, 
-            mcUsername, 
-            queue, 
-            cooldown, 
-            proxy: proxy ? `${proxy.host}:${proxy.port}` : 'None' 
-        });
+        bots.set(botId, botData);
         
         return { 
             success: true, 
@@ -190,7 +249,7 @@ async function createBot(botId, host, port, alteningToken, proxyString = null) {
         };
         
     } catch (error) {
-        console.error(`[${botId}] ❌ ${error.message}`);
+        console.error(`[${botId}] ❌ Failed: ${error.message}`);
         throw error;
     }
 }
@@ -215,6 +274,19 @@ app.post('/remove', (req, res) => {
     bot.client.end();
     bots.delete(username);
     res.json({ success: true });
+});
+
+app.post('/stopall', (req, res) => {
+    const count = bots.size;
+    bots.forEach((bot) => {
+        try {
+            bot.client.end();
+        } catch (err) {
+            console.error('Error stopping bot:', err.message);
+        }
+    });
+    bots.clear();
+    res.json({ success: true, stopped: count });
 });
 
 app.post('/chat', (req, res) => {
@@ -249,7 +321,7 @@ app.get('/status', (req, res) => {
     const status = Array.from(bots.entries()).map(([username, bot]) => ({
         username,
         mcUsername: bot.mcUsername,
-        connected: bot.client._client?.socket?.writable || false,
+        connected: bot.isOnline,
         queue: bot.queue.length,
         cooldowns: bot.cooldown.size,
         proxy: bot.proxy
@@ -257,7 +329,7 @@ app.get('/status', (req, res) => {
     res.json({ success: true, count: bots.size, bots: status });
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', bots: bots.size }));
+app.get('/', (req, res) => res.json({ status: 'online', bots: bots.size, banned: bannedAccounts.size }));
 app.get('/health', (req, res) => res.json({ healthy: true }));
 
 const PORT = process.env.PORT || 8080;
@@ -265,4 +337,5 @@ app.listen(PORT, () => {
     console.log(`✅ Running on ${PORT}`);
     console.log(`🌐 Proxies: ${PROXIES.length}`);
     console.log(`🔑 TheAltening Mode: ENABLED`);
+    console.log(`🔄 Auto-Reconnect: ENABLED`);
 });
