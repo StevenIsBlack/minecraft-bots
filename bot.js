@@ -1,6 +1,5 @@
-const mc = require('minecraft-protocol');
+const mineflayer = require('mineflayer');
 const express = require('express');
-const axios = require('axios');
 const app = express();
 
 app.use(express.json());
@@ -26,73 +25,8 @@ function decodeJWT(token) {
         let payload = parts[1];
         while (payload.length % 4 !== 0) payload += '=';
         return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
-    } catch {
-        return null;
-    }
-}
-
-// CRITICAL: Convert Xbox token to Minecraft token WITHOUT Microsoft login
-async function getMinecraftToken(xboxToken) {
-    try {
-        console.log('🔄 Converting Xbox token to Minecraft...');
-        
-        // Step 1: Get XSTS token
-        const xstsResponse = await axios.post(
-            'https://xsts.auth.xboxlive.com/xsts/authorize',
-            {
-                Properties: {
-                    SandboxId: 'RETAIL',
-                    UserTokens: [xboxToken]
-                },
-                RelyingParty: 'rp://api.minecraftservices.com/',
-                TokenType: 'JWT'
-            },
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                    'x-xbl-contract-version': '1'
-                },
-                validateStatus: () => true
-            }
-        );
-
-        if (xstsResponse.status !== 200) {
-            console.log('❌ XSTS failed:', xstsResponse.data);
-            return null;
-        }
-
-        const xstsToken = xstsResponse.data.Token;
-        const userHash = xstsResponse.data.DisplayClaims.xui[0].uhs;
-
-        console.log('✅ Got XSTS token');
-
-        // Step 2: Get Minecraft access token
-        const mcResponse = await axios.post(
-            'https://api.minecraftservices.com/authentication/login_with_xbox',
-            {
-                identityToken: `XBL3.0 x=${userHash};${xstsToken}`
-            },
-            {
-                headers: { 'Content-Type': 'application/json' },
-                validateStatus: () => true
-            }
-        );
-
-        if (mcResponse.status !== 200) {
-            console.log('❌ MC auth failed:', mcResponse.data);
-            return null;
-        }
-
-        console.log('✅ Got Minecraft token!');
-        
-        return {
-            accessToken: mcResponse.data.access_token,
-            userHash: userHash
-        };
-
-    } catch (error) {
-        console.error('Token conversion error:', error.message);
+    } catch (e) {
+        console.error('JWT decode error:', e.message);
         return null;
     }
 }
@@ -144,50 +78,41 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         const tokenData = decodeJWT(creds.token);
 
         if (!tokenData) {
-            throw new Error('Invalid token');
+            throw new Error('Invalid token - could not decode JWT');
         }
 
+        // Extract the ACTUAL Minecraft username from token
         const mcName = tokenData.pfd?.[0]?.name;
         const mcUuid = tokenData.pfd?.[0]?.id || tokenData.profiles?.mc;
+        const xuid = tokenData.xuid;
 
-        if (!mcName) {
-            throw new Error('No Minecraft profile in token');
+        if (!mcName || !mcUuid) {
+            throw new Error('Token missing Minecraft profile data');
         }
 
-        console.log(`[${botId}] 👤 ${mcName}`);
-        console.log(`[${botId}] 🆔 ${mcUuid}`);
+        console.log(`[${botId}] 👤 Username: ${mcName}`);
+        console.log(`[${botId}] 🆔 UUID: ${mcUuid}`);
+        console.log(`[${botId}] 🎫 XUID: ${xuid}`);
 
-        // Try to convert Xbox token to Minecraft token
-        const mcAuth = await getMinecraftToken(creds.token);
+        console.log(`[${botId}] 🔌 Connecting with session token...`);
 
-        let accessToken;
-        if (mcAuth) {
-            console.log(`[${botId}] ✅ Using converted Minecraft token`);
-            accessToken = mcAuth.accessToken;
-        } else {
-            console.log(`[${botId}] ⚠️ Using Xbox token directly (might not work)`);
-            accessToken = creds.token;
-        }
-
-        console.log(`[${botId}] 🔌 Connecting...`);
-
-        // Use minecraft-protocol with session injection
-        const client = mc.createClient({
+        // EXACTLY like Session Login mod - use session directly
+        const client = mineflayer.createBot({
             host: host,
             port: port,
-            username: mcName,
-            accessToken: accessToken,
-            clientToken: tokenData.xuid || tokenData.aid,
+            username: mcName, // Use the actual MC username from token
+            auth: 'microsoft', // Server expects Microsoft auth
             session: {
-                accessToken: accessToken,
-                clientToken: tokenData.xuid || tokenData.aid,
+                // Inject the session from the token
+                accessToken: creds.token,
+                clientToken: xuid,
                 selectedProfile: {
                     id: mcUuid,
                     name: mcName
                 }
             },
-            auth: 'mojang', // Use Mojang auth mode (not Microsoft)
-            skipValidation: true,
+            profilesFolder: false, // Don't save profiles
+            skipValidation: true, // Skip validation
             version: false,
             hideErrors: false
         });
@@ -209,51 +134,36 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             isOnline: false
         };
         
-        client.on('connect', () => {
-            console.log(`[${botId}] 🔌 Connected to server`);
-        });
-
-        client.on('success', () => {
-            console.log(`[${botId}] ✅ Authentication successful!`);
-        });
-
-        client.on('login', (packet) => {
-            console.log(`[${botId}] ✅ LOGGED IN as ${mcName}!`);
+        client.on('login', () => {
+            console.log(`[${botId}] ✅ LOGGED IN as ${client.username}!`);
             isOnline = true;
             botData.isOnline = true;
             reconnectAttempts = 0;
         });
         
-        client.on('spawn_position', () => {
+        client.on('spawn', () => {
             console.log(`[${botId}] 🎮 SPAWNED!`);
         });
         
-        client.on('chat', (packet) => {
-            try {
-                let text = typeof packet.message === 'string' ? JSON.parse(packet.message) : packet.message;
-                const msg = extractText(text);
-                
-                if (!msg || msg.includes('[AutoMsg]') || msg.includes('discord.gg')) return;
-                
-                const name = parseName(msg, mcName);
-                if (name && !cooldown.has(name) && !queue.includes(name)) {
-                    queue.push(name);
-                    console.log(`[${botId}] 📥 ${name}`);
-                }
-            } catch {}
+        client.on('messagestr', (message) => {
+            if (message.includes('[AutoMsg]') || message.includes('discord.gg')) return;
+            
+            const name = parseName(message, mcName);
+            if (name && !cooldown.has(name) && !queue.includes(name)) {
+                queue.push(name);
+                console.log(`[${botId}] 📥 ${name}`);
+            }
         });
         
         const sender = setInterval(() => {
-            if (!isOnline || !client.socket?.writable) return;
+            if (!isOnline || !client._client?.socket) return;
             
             const now = Date.now();
             if (now - lastSend >= 2000 && queue.length > 0) {
                 const target = queue.shift();
                 
                 try {
-                    client.write('chat', {
-                        message: `/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`
-                    });
+                    client.chat(`/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`);
                     console.log(`[${botId}] 📨 → ${target}`);
                     lastSend = now;
                     cooldown.add(target);
@@ -262,19 +172,14 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             }
         }, 100);
         
-        client.on('kick_disconnect', (packet) => {
+        client.on('kicked', (reason) => {
             clearInterval(sender);
-            try {
-                const reason = JSON.parse(packet.reason);
-                console.error(`[${botId}] 🚫 KICKED: ${reason.text || JSON.stringify(reason)}`);
-                
-                if ((reason.text || '').toLowerCase().includes('ban')) {
-                    bannedAccounts.add(botId);
-                    bots.delete(botId);
-                    return;
-                }
-            } catch {
-                console.error(`[${botId}] 🚫 KICKED`);
+            console.error(`[${botId}] 🚫 KICKED: ${reason}`);
+            
+            if (reason.toLowerCase().includes('ban')) {
+                bannedAccounts.add(botId);
+                bots.delete(botId);
+                return;
             }
             
             botData.isOnline = false;
@@ -289,20 +194,9 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             }
         });
         
-        client.on('disconnect', (packet) => {
-            clearInterval(sender);
-            try {
-                const reason = JSON.parse(packet.reason);
-                console.log(`[${botId}] 🔌 Disconnect: ${reason.text || 'Unknown'}`);
-            } catch {
-                console.log(`[${botId}] 🔌 Disconnected`);
-            }
-            botData.isOnline = false;
-        });
-
         client.on('end', () => {
             clearInterval(sender);
-            console.log(`[${botId}] 🔌 Connection ended`);
+            console.log(`[${botId}] 🔌 Disconnected`);
             botData.isOnline = false;
         });
         
@@ -356,9 +250,7 @@ app.post('/forcemsg', (req, res) => {
     
     setTimeout(() => {
         try {
-            bot.client.write('chat', {
-                message: `/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`
-            });
+            bot.client.chat(`/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`);
         } catch {}
     }, 1000);
     
@@ -382,5 +274,5 @@ app.get('/health', (req, res) => res.json({ healthy: true }));
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`✅ Running on ${PORT}`);
-    console.log(`🎫 Direct Protocol Auth: ENABLED`);
+    console.log(`🎫 Session Token Mode: ENABLED`);
 });
