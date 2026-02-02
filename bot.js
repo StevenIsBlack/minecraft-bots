@@ -1,34 +1,66 @@
 const mineflayer = require('mineflayer');
+const { Authflow } = require('prismarine-auth');
 const express = require('express');
-const app = express();
+const fs = require('fs');
+const path = require('path');
 
+const app = express();
 app.use(express.json());
 
 const bots = new Map();
 const bannedAccounts = new Set();
+const CACHE_DIR = './auth_cache';
+
+if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
 function parseCredentials(input) {
     const parts = input.split(':');
     if (parts.length >= 3) {
-        // email:password:token format
         return {
-            type: 'session',
             email: parts[0],
             password: parts[1],
             token: parts.slice(2).join(':')
         };
-    } else if (parts.length === 2) {
-        // email:password format (real accounts)
+    }
+    return null;
+}
+
+function decodeJWT(token) {
+    try {
+        const parts = token.split('.');
+        let payload = parts[1];
+        while (payload.length % 4 !== 0) payload += '=';
+        return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+    } catch {
+        return null;
+    }
+}
+
+// CUSTOM AUTH FLOW THAT USES YOUR TOKENS
+class TokenAuthflow extends Authflow {
+    constructor(email, cacheDir, token, tokenData) {
+        super(email, cacheDir);
+        this.customToken = token;
+        this.tokenData = tokenData;
+    }
+
+    // Override to use our token instead of interactive login
+    async getXboxToken(relyingParty) {
+        console.log('🎫 Using custom token for Xbox auth');
         return {
-            type: 'account',
-            email: parts[0],
-            password: parts[1]
+            userHash: this.tokenData.xuid || 'custom',
+            XSTSToken: this.customToken,
+            expiresOn: this.tokenData.exp ? new Date(this.tokenData.exp * 1000) : new Date(Date.now() + 86400000)
         };
-    } else {
-        // Just a token
+    }
+
+    async getMsaToken() {
+        console.log('🎫 Using custom token for MSA');
         return {
-            type: 'token',
-            token: input
+            token: this.customToken,
+            expires_on: this.tokenData.exp || Date.now() + 86400000
         };
     }
 }
@@ -74,61 +106,53 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             return { success: false, error: 'Banned' };
         }
 
-        console.log(`[${botId}] ${isReconnect ? '🔄 Reconnecting' : '🚀 Starting'}...`);
+        console.log(`[${botId}] ${isReconnect ? '🔄' : '🚀'} Starting...`);
         
         const creds = parseCredentials(credentials);
-        console.log(`[${botId}] 📋 Type: ${creds.type}`);
+        if (!creds) {
+            throw new Error('Invalid credentials format. Use: email:password:token');
+        }
+
+        const tokenData = decodeJWT(creds.token);
+        if (!tokenData) {
+            throw new Error('Invalid token - could not decode');
+        }
+
+        const mcName = tokenData.pfd?.[0]?.name;
+        const mcUuid = tokenData.pfd?.[0]?.id || tokenData.profiles?.mc;
+
+        if (!mcName) {
+            throw new Error('Token missing Minecraft profile');
+        }
+
+        console.log(`[${botId}] 👤 Account: ${mcName}`);
+        console.log(`[${botId}] 🆔 UUID: ${mcUuid}`);
         
-        let clientOptions = {
+        // Use custom authflow with token
+        const authflow = new TokenAuthflow(creds.email, CACHE_DIR, creds.token, tokenData);
+        
+        console.log(`[${botId}] 🔌 Connecting...`);
+        
+        const client = mineflayer.createBot({
             host: host,
             port: port,
+            username: mcName,
+            auth: 'microsoft',
+            authflow: authflow,
             version: false,
-            hideErrors: false
-        };
-        
-        // Configure based on credential type
-        if (creds.type === 'account') {
-            // Real Microsoft/Mojang account
-            console.log(`[${botId}] 🔑 Using account: ${creds.email}`);
-            clientOptions.username = creds.email;
-            clientOptions.password = creds.password;
-            clientOptions.auth = 'microsoft';
-        } else if (creds.type === 'session') {
-            // Session token (your original tokens)
-            console.log(`[${botId}] 🎫 Using session token`);
-            clientOptions.username = creds.email;
-            clientOptions.auth = 'offline'; // Start offline, we'll inject session
-            clientOptions.skipValidation = true;
-        } else {
-            // Just a token (TheAltening or similar)
-            console.log(`[${botId}] 🎟️ Using token`);
-            clientOptions.username = creds.token.substring(0, 16); // Use part of token as username
-            clientOptions.auth = 'offline';
-            clientOptions.skipValidation = true;
-        }
-        
-        console.log(`[${botId}] 🔌 Connecting to ${host}:${port}...`);
-        const client = mineflayer.createBot(clientOptions);
-        
-        // If using session token, inject it after connection
-        if (creds.type === 'session') {
-            client.on('session', () => {
-                console.log(`[${botId}] 🎫 Injecting session token...`);
-                // Try to use the session token
-                // This might not work - depends on server
-            });
-        }
-        
+            hideErrors: false,
+            skipValidation: true
+        });
+
         const queue = [];
         const cooldown = new Set();
         let lastSend = 0;
         let isOnline = false;
-        let mcUsername = creds.email || creds.token.substring(0, 16);
         let reconnectAttempts = 0;
         
         const botData = {
             client,
-            mcUsername,
+            mcUsername: mcName,
             queue,
             cooldown,
             credentials,
@@ -138,9 +162,7 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         };
         
         client.on('login', () => {
-            mcUsername = client.username || mcUsername;
-            botData.mcUsername = mcUsername;
-            console.log(`[${botId}] ✅ LOGGED IN as ${mcUsername}!`);
+            console.log(`[${botId}] ✅ LOGGED IN as ${mcName}!`);
             isOnline = true;
             botData.isOnline = true;
             reconnectAttempts = 0;
@@ -153,10 +175,10 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         client.on('messagestr', (message) => {
             if (message.includes('[AutoMsg]') || message.includes('discord.gg')) return;
             
-            const name = parseName(message, mcUsername);
+            const name = parseName(message, mcName);
             if (name && !cooldown.has(name) && !queue.includes(name)) {
                 queue.push(name);
-                console.log(`[${botId}] 📥 Queued: ${name}`);
+                console.log(`[${botId}] 📥 ${name}`);
             }
         });
         
@@ -211,7 +233,7 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         
         bots.set(botId, botData);
         
-        return { success: true, mcUsername };
+        return { success: true, mcUsername: mcName, uuid: mcUuid };
         
     } catch (error) {
         console.error(`[${botId}] ❌ ${error.message}`);
@@ -279,5 +301,5 @@ app.get('/health', (req, res) => res.json({ healthy: true }));
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`✅ Running on ${PORT}`);
-    console.log(`🔑 Supports: email:password:token OR email:password`);
+    console.log(`🎫 Custom Token Auth: ENABLED`);
 });
