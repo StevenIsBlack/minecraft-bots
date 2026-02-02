@@ -10,6 +10,7 @@ app.use(express.json());
 const bots = new Map();
 const bannedAccounts = new Set();
 const CACHE_DIR = './auth_cache';
+const MAX_QUEUE_SIZE = 100; // Maximum 100 people in queue
 
 if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -18,7 +19,7 @@ if (!fs.existsSync(CACHE_DIR)) {
 function parseCredentials(input) {
     const parts = input.split(':');
     if (parts.length < 3) {
-        throw new Error('Invalid format. Use: email:password:token');
+        throw new Error('Invalid format');
     }
     return {
         email: parts[0],
@@ -33,46 +34,45 @@ function decodeJWT(token) {
         let payload = parts[1];
         while (payload.length % 4 !== 0) payload += '=';
         return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
-    } catch (e) {
+    } catch {
         return null;
     }
 }
 
-// Custom Authflow that uses your token WITHOUT asking for login
-class CachedAuthflow extends Authflow {
+// FIXED: Authflow that NEVER asks for login
+class NoLoginAuthflow extends Authflow {
     constructor(username, cache, token, tokenData) {
-        super(username, cache);
-        this.token = token;
+        super(username, cache, { authTitle: 'MinecraftJava', flow: 'live' });
+        this.customToken = token;
         this.tokenData = tokenData;
-        this.mcProfile = {
+        this.profile = {
             id: tokenData.pfd?.[0]?.id || tokenData.profiles?.mc,
             name: tokenData.pfd?.[0]?.name
         };
+        
+        // Pre-create cache to prevent login prompt
+        this.createFakeCache(cache, username);
     }
 
-    async getMinecraftJavaToken(options = {}) {
-        // Return cached token instead of doing login flow
+    createFakeCache(cacheDir, username) {
+        try {
+            const cacheFile = path.join(cacheDir, `${username}.json`);
+            const fakeCache = {
+                mca: {
+                    access_token: this.customToken,
+                    expires_on: this.tokenData.exp ? this.tokenData.exp * 1000 : Date.now() + 86400000,
+                    profile: this.profile
+                }
+            };
+            fs.writeFileSync(cacheFile, JSON.stringify(fakeCache));
+        } catch {}
+    }
+
+    async getMinecraftJavaToken() {
         return {
-            token: this.token,
+            token: this.customToken,
             expires_on: this.tokenData.exp ? new Date(this.tokenData.exp * 1000) : new Date(Date.now() + 86400000),
-            profile: this.mcProfile
-        };
-    }
-
-    async getXboxToken(relyingParty) {
-        // Return fake Xbox token to satisfy auth flow
-        return {
-            userHash: this.tokenData.xuid || 'cached',
-            XSTSToken: this.token,
-            expiresOn: this.tokenData.exp ? new Date(this.tokenData.exp * 1000) : new Date(Date.now() + 86400000)
-        };
-    }
-
-    async getMsaToken() {
-        // Return the token we already have
-        return {
-            token: this.token,
-            expires_on: this.tokenData.exp || (Date.now() / 1000) + 86400
+            profile: this.profile
         };
     }
 }
@@ -106,7 +106,6 @@ function generateRandom() {
 async function createBot(botId, host, port, credentials, isReconnect = false) {
     try {
         if (bannedAccounts.has(botId)) {
-            console.log(`[${botId}] ⛔ Banned`);
             return { success: false, error: 'Banned' };
         }
 
@@ -122,16 +121,13 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         const mcName = tokenData.pfd?.[0]?.name;
         const mcUuid = tokenData.pfd?.[0]?.id || tokenData.profiles?.mc;
 
-        if (!mcName || !mcUuid) {
-            throw new Error('Token missing Minecraft profile');
+        if (!mcName) {
+            throw new Error('No Minecraft profile');
         }
 
         console.log(`[${botId}] 👤 ${mcName}`);
 
-        // Use custom authflow that doesn't ask for login
-        const authflow = new CachedAuthflow(creds.email, CACHE_DIR, creds.token, tokenData);
-
-        console.log(`[${botId}] 🔌 Connecting...`);
+        const authflow = new NoLoginAuthflow(creds.email, CACHE_DIR, creds.token, tokenData);
 
         const client = mineflayer.createBot({
             host: host,
@@ -146,15 +142,18 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
 
         const queue = [];
         const cooldown = new Set();
+        const processedPlayers = new Set(); // Track who we've already queued
         let lastSend = 0;
         let isOnline = false;
         let reconnectAttempts = 0;
+        let queueCycle = 0; // Track queue cycles
         
         const botData = {
             client,
             mcUsername: mcName,
             queue,
             cooldown,
+            processedPlayers,
             credentials,
             host,
             port,
@@ -162,7 +161,7 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         };
         
         client.on('login', () => {
-            console.log(`[${botId}] ✅ LOGGED IN as ${client.username}!`);
+            console.log(`[${botId}] ✅ LOGGED IN as ${mcName}!`);
             isOnline = true;
             botData.isOnline = true;
             reconnectAttempts = 0;
@@ -172,18 +171,29 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             console.log(`[${botId}] 🎮 SPAWNED!`);
         });
         
-        // ONLY log messages from OTHER players (not all chat)
         client.on('messagestr', (message) => {
-            // Ignore our own messages, discord links, and system messages
             if (message.includes('[AutoMsg]') || 
                 message.includes('discord.gg') ||
                 message.includes(mcName)) return;
             
             const name = parseName(message, mcName);
-            if (name && !cooldown.has(name) && !queue.includes(name)) {
+            
+            // FIXED: Only queue if under 100 AND not already processed in this cycle
+            if (name && 
+                !cooldown.has(name) && 
+                !queue.includes(name) && 
+                !processedPlayers.has(name) &&
+                queue.length < MAX_QUEUE_SIZE) {
+                
                 queue.push(name);
-                // Only log when we queue someone
-                console.log(`[${botId}] 📥 Queued: ${name} (Queue: ${queue.length})`);
+                processedPlayers.add(name); // Mark as processed
+                console.log(`[${botId}] 📥 Queued: ${name} (${queue.length}/${MAX_QUEUE_SIZE})`);
+                
+                // When queue reaches 100, log it
+                if (queue.length === MAX_QUEUE_SIZE) {
+                    queueCycle++;
+                    console.log(`[${botId}] 📊 Queue FULL (Cycle #${queueCycle}) - Now sending messages...`);
+                }
             }
         });
         
@@ -195,15 +205,18 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                 const target = queue.shift();
                 
                 try {
-                    const msg = `/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`;
-                    client.chat(msg);
-                    
-                    // ONLY LOG SENT MESSAGES
-                    console.log(`[${botId}] ✅ Sent to ${target} | Remaining: ${queue.length}`);
+                    client.chat(`/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`);
+                    console.log(`[${botId}] ✅ → ${target} | Remaining: ${queue.length}`);
                     
                     lastSend = now;
                     cooldown.add(target);
                     setTimeout(() => cooldown.delete(target), 5000);
+                    
+                    // When queue is empty, reset for next cycle
+                    if (queue.length === 0) {
+                        processedPlayers.clear();
+                        console.log(`[${botId}] 🔄 Queue empty - Collecting new players...`);
+                    }
                 } catch {}
             }
         }, 100);
@@ -237,7 +250,6 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         });
         
         client.on('error', (err) => {
-            // Only log important errors
             if (!err.message.includes('keepalive')) {
                 console.error(`[${botId}] ❌ ${err.message}`);
             }
@@ -284,17 +296,28 @@ app.post('/stopall', (req, res) => {
 
 app.post('/forcemsg', (req, res) => {
     const { username, target } = req.body;
+    if (!username || !target) {
+        return res.status(400).json({ success: false, error: 'Missing username or target' });
+    }
+    
     const bot = bots.get(username);
-    if (!bot) return res.status(404).json({ success: false, error: 'Not found' });
+    if (!bot) {
+        return res.status(404).json({ success: false, error: 'Bot not found' });
+    }
     
-    setTimeout(() => {
-        try {
-            bot.client.chat(`/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`);
-            console.log(`[${username}] 🎯 Force sent to ${target}`);
-        } catch {}
-    }, 1000);
+    if (!bot.isOnline) {
+        return res.status(400).json({ success: false, error: 'Bot is not online' });
+    }
     
-    res.json({ success: true });
+    try {
+        const msg = `/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`;
+        bot.client.chat(msg);
+        console.log(`[${username}] 🎯 Force sent to ${target}`);
+        res.json({ success: true, message: `Sent to ${target}` });
+    } catch (error) {
+        console.error(`[${username}] Force message failed: ${error.message}`);
+        res.status(500).json({ success: false, error: error.message });
+    }
 });
 
 app.get('/status', (req, res) => {
@@ -303,7 +326,8 @@ app.get('/status', (req, res) => {
         mcUsername: bot.mcUsername,
         connected: bot.isOnline,
         queue: bot.queue.length,
-        cooldowns: bot.cooldown.size
+        cooldowns: bot.cooldown.size,
+        processed: bot.processedPlayers.size
     }));
     res.json({ success: true, count: bots.size, bots: status });
 });
@@ -314,6 +338,6 @@ app.get('/health', (req, res) => res.json({ healthy: true }));
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`✅ Running on ${PORT}`);
-    console.log(`🎫 No-Auth Mode: ENABLED`);
-    console.log(`📊 Clean Logs: ENABLED`);
+    console.log(`🎫 No-Auth: ENABLED`);
+    console.log(`📊 Max Queue: ${MAX_QUEUE_SIZE}`);
 });
