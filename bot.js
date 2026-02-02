@@ -1,11 +1,19 @@
 const mineflayer = require('mineflayer');
+const { Authflow } = require('prismarine-auth');
 const express = require('express');
-const app = express();
+const fs = require('fs');
+const path = require('path');
 
+const app = express();
 app.use(express.json());
 
 const bots = new Map();
 const bannedAccounts = new Set();
+const CACHE_DIR = './auth_cache';
+
+if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
 function parseCredentials(input) {
     const parts = input.split(':');
@@ -26,17 +34,47 @@ function decodeJWT(token) {
         while (payload.length % 4 !== 0) payload += '=';
         return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
     } catch (e) {
-        console.error('JWT decode error:', e.message);
         return null;
     }
 }
 
-function extractText(component) {
-    if (typeof component === 'string') return component;
-    if (!component) return '';
-    let text = component.text || '';
-    if (component.extra) component.extra.forEach(e => text += extractText(e));
-    return text;
+// Custom Authflow that uses your token WITHOUT asking for login
+class CachedAuthflow extends Authflow {
+    constructor(username, cache, token, tokenData) {
+        super(username, cache);
+        this.token = token;
+        this.tokenData = tokenData;
+        this.mcProfile = {
+            id: tokenData.pfd?.[0]?.id || tokenData.profiles?.mc,
+            name: tokenData.pfd?.[0]?.name
+        };
+    }
+
+    async getMinecraftJavaToken(options = {}) {
+        // Return cached token instead of doing login flow
+        return {
+            token: this.token,
+            expires_on: this.tokenData.exp ? new Date(this.tokenData.exp * 1000) : new Date(Date.now() + 86400000),
+            profile: this.mcProfile
+        };
+    }
+
+    async getXboxToken(relyingParty) {
+        // Return fake Xbox token to satisfy auth flow
+        return {
+            userHash: this.tokenData.xuid || 'cached',
+            XSTSToken: this.token,
+            expiresOn: this.tokenData.exp ? new Date(this.tokenData.exp * 1000) : new Date(Date.now() + 86400000)
+        };
+    }
+
+    async getMsaToken() {
+        // Return the token we already have
+        return {
+            token: this.token,
+            expires_on: this.tokenData.exp || (Date.now() / 1000) + 86400
+        };
+    }
 }
 
 function parseName(text, myName) {
@@ -78,43 +116,32 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         const tokenData = decodeJWT(creds.token);
 
         if (!tokenData) {
-            throw new Error('Invalid token - could not decode JWT');
+            throw new Error('Invalid token');
         }
 
-        // Extract the ACTUAL Minecraft username from token
         const mcName = tokenData.pfd?.[0]?.name;
         const mcUuid = tokenData.pfd?.[0]?.id || tokenData.profiles?.mc;
-        const xuid = tokenData.xuid;
 
         if (!mcName || !mcUuid) {
-            throw new Error('Token missing Minecraft profile data');
+            throw new Error('Token missing Minecraft profile');
         }
 
-        console.log(`[${botId}] 👤 Username: ${mcName}`);
-        console.log(`[${botId}] 🆔 UUID: ${mcUuid}`);
-        console.log(`[${botId}] 🎫 XUID: ${xuid}`);
+        console.log(`[${botId}] 👤 ${mcName}`);
 
-        console.log(`[${botId}] 🔌 Connecting with session token...`);
+        // Use custom authflow that doesn't ask for login
+        const authflow = new CachedAuthflow(creds.email, CACHE_DIR, creds.token, tokenData);
 
-        // EXACTLY like Session Login mod - use session directly
+        console.log(`[${botId}] 🔌 Connecting...`);
+
         const client = mineflayer.createBot({
             host: host,
             port: port,
-            username: mcName, // Use the actual MC username from token
-            auth: 'microsoft', // Server expects Microsoft auth
-            session: {
-                // Inject the session from the token
-                accessToken: creds.token,
-                clientToken: xuid,
-                selectedProfile: {
-                    id: mcUuid,
-                    name: mcName
-                }
-            },
-            profilesFolder: false, // Don't save profiles
-            skipValidation: true, // Skip validation
+            username: mcName,
+            auth: 'microsoft',
+            authflow: authflow,
             version: false,
-            hideErrors: false
+            hideErrors: false,
+            skipValidation: true
         });
 
         const queue = [];
@@ -145,13 +172,18 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             console.log(`[${botId}] 🎮 SPAWNED!`);
         });
         
+        // ONLY log messages from OTHER players (not all chat)
         client.on('messagestr', (message) => {
-            if (message.includes('[AutoMsg]') || message.includes('discord.gg')) return;
+            // Ignore our own messages, discord links, and system messages
+            if (message.includes('[AutoMsg]') || 
+                message.includes('discord.gg') ||
+                message.includes(mcName)) return;
             
             const name = parseName(message, mcName);
             if (name && !cooldown.has(name) && !queue.includes(name)) {
                 queue.push(name);
-                console.log(`[${botId}] 📥 ${name}`);
+                // Only log when we queue someone
+                console.log(`[${botId}] 📥 Queued: ${name} (Queue: ${queue.length})`);
             }
         });
         
@@ -163,8 +195,12 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                 const target = queue.shift();
                 
                 try {
-                    client.chat(`/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`);
-                    console.log(`[${botId}] 📨 → ${target}`);
+                    const msg = `/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`;
+                    client.chat(msg);
+                    
+                    // ONLY LOG SENT MESSAGES
+                    console.log(`[${botId}] ✅ Sent to ${target} | Remaining: ${queue.length}`);
+                    
                     lastSend = now;
                     cooldown.add(target);
                     setTimeout(() => cooldown.delete(target), 5000);
@@ -201,7 +237,10 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         });
         
         client.on('error', (err) => {
-            console.error(`[${botId}] ❌ ${err.message}`);
+            // Only log important errors
+            if (!err.message.includes('keepalive')) {
+                console.error(`[${botId}] ❌ ${err.message}`);
+            }
         });
         
         bots.set(botId, botData);
@@ -251,6 +290,7 @@ app.post('/forcemsg', (req, res) => {
     setTimeout(() => {
         try {
             bot.client.chat(`/msg ${target} discord.gg\\bills cheapest market ${generateRandom()}`);
+            console.log(`[${username}] 🎯 Force sent to ${target}`);
         } catch {}
     }, 1000);
     
@@ -274,5 +314,6 @@ app.get('/health', (req, res) => res.json({ healthy: true }));
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`✅ Running on ${PORT}`);
-    console.log(`🎫 Session Token Mode: ENABLED`);
+    console.log(`🎫 No-Auth Mode: ENABLED`);
+    console.log(`📊 Clean Logs: ENABLED`);
 });
