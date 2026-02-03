@@ -76,30 +76,31 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
 
         if (!tokenData) throw new Error('Invalid token');
 
-        const mcName = tokenData.pfd?.[0]?.name;
-        const mcUuid = tokenData.pfd?.[0]?.id || tokenData.profiles?.mc;
+        const mcName = tokenData.pfd?.[0]?.name || tokenData.selectedProfile?.name;
+        const mcUuid = tokenData.pfd?.[0]?.id || tokenData.selectedProfile?.id || tokenData.profiles?.mc;
 
         if (!mcName || !mcUuid) throw new Error('No Minecraft profile');
 
         console.log(`[${botId}] 👤 ${mcName}`);
         console.log(`[${botId}] 🆔 ${mcUuid}`);
 
+        // Fixed authentication configuration
         const client = mc.createClient({
             host: host,
             port: port,
             username: mcName,
-            accessToken: creds.token,
-            clientToken: tokenData.xuid || mcUuid,
+            auth: 'microsoft',
+            // Use the access token properly
             session: {
                 accessToken: creds.token,
-                clientToken: tokenData.xuid || mcUuid,
+                clientToken: tokenData.xuid || tokenData.clientToken || mcUuid,
                 selectedProfile: {
                     id: mcUuid,
                     name: mcName
                 }
             },
-            skipValidation: true,
-            version: false,
+            // Remove skipValidation and let the library handle it properly
+            version: '1.20.4', // Specify a version instead of false
             hideErrors: false
         });
 
@@ -162,7 +163,7 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                     queue.length < MAX_QUEUE_SIZE) {
                     
                     queue.push(name);
-                    console.log(`[${botId}] 📥 ${name} (${queue.length}/${MAX_QUEUE_SIZE})`);
+                    console.log(`[${botId}] 🔥 ${name} (${queue.length}/${MAX_QUEUE_SIZE})`);
                     
                     if (queue.length === MAX_QUEUE_SIZE) {
                         isCollecting = false;
@@ -231,7 +232,6 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             console.log(`[${botId}] ✅ Force stopped`);
         };
         
-        // DETAILED KICK LOGGING
         client.on('kick_disconnect', (packet) => {
             clearInterval(sender);
             if (forceSender) clearInterval(forceSender);
@@ -245,7 +245,6 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                 console.error(`[${botId}] 📋 Raw: ${JSON.stringify(reason)}`);
                 console.error(`[${botId}] ================================`);
                 
-                // Check if it's muted
                 if (reasonText.toLowerCase().includes('mute') || 
                     reasonText.toLowerCase().includes('silenced') ||
                     reasonText.toLowerCase().includes('chat') ||
@@ -256,7 +255,6 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                     return;
                 }
                 
-                // Check if banned
                 if (reasonText.toLowerCase().includes('ban')) {
                     console.log(`[${botId}] ⛔ Account BANNED`);
                     bannedAccounts.add(botId);
@@ -269,8 +267,6 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             }
             
             botData.isOnline = false;
-            
-            // Don't reconnect - just remove
             bots.delete(botId);
         });
         
@@ -297,6 +293,9 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         
         client.on('error', (err) => {
             console.error(`[${botId}] ❌ Error: ${err.message}`);
+            if (err.message.includes('Failed to obtain profile data')) {
+                console.error(`[${botId}] ⚠️ Authentication failed - token may be invalid or expired`);
+            }
         });
         
         bots.set(botId, botData);
@@ -381,6 +380,6 @@ app.get('/health', (req, res) => res.json({ healthy: true }));
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`✅ Running on ${PORT}`);
-    console.log(`🎫 Direct Session Mode`);
+    console.log(`🎫 Microsoft Auth Mode`);
     console.log(`📊 Queue: 100/cycle`);
 });
