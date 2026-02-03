@@ -208,7 +208,7 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                     const target = queue.shift();
                     
                     try {
-                        client.chat(`/msg ${target} discord.gg\\bils ${generateRandom()}`);
+                        client.chat(`/msg ${target} discord.gg\\bills ${generateRandom()}`);
                         console.log(`[${botId}] ✅ → ${target} | Left: ${queue.length}`);
                         
                         lastSend = now;
@@ -241,7 +241,7 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                 }
                 
                 try {
-                    client.chat(`/msg ${forceTarget} discord.gg\\bils ${generateRandom()}`);
+                    client.chat(`/msg ${forceTarget} discord.gg\\bills ${generateRandom()}`);
                     console.log(`[${botId}] 🎯 FORCE → ${forceTarget}`);
                 } catch {}
             }, 2000);
