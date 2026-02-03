@@ -1,5 +1,6 @@
 const mc = require('minecraft-protocol');
 const express = require('express');
+const https = require('https');
 const app = express();
 
 app.use(express.json());
@@ -72,16 +73,14 @@ async function createBot(botId, host, port, credentials) {
         const tokenData = decodeJWT(creds.token);
 
         if (!tokenData) {
-            throw new Error('Invalid token - cannot decode');
+            throw new Error('Invalid token');
         }
 
-        // Extract from the EXACT structure we see in your token
         const mcName = tokenData.pfd?.[0]?.name;
         const mcUuid = tokenData.pfd?.[0]?.id;
         const xuid = tokenData.xuid;
 
         if (!mcName || !mcUuid) {
-            console.error('Token data:', JSON.stringify(tokenData, null, 2));
             throw new Error('No Minecraft profile in token');
         }
 
@@ -89,26 +88,27 @@ async function createBot(botId, host, port, credentials) {
         console.log(`[${botId}] 🆔 ${mcUuid}`);
         console.log(`[${botId}] 🎮 XUID: ${xuid}`);
 
-        // Create client using the EXACT session format that works with the session login mod
+        // Format UUID properly (remove dashes for session)
+        const uuidNoDashes = mcUuid.replace(/-/g, '');
+
+        // Create client with custom session handling
         const client = mc.createClient({
             host: host,
             port: port,
             username: mcName,
-            // Use the token directly as access token
-            accessToken: creds.token,
-            // Use XUID as client token (this is what the session login mod does)
-            clientToken: xuid,
-            // Provide the session in the format Mojang expects
+            // Provide session directly
             session: {
                 accessToken: creds.token,
                 clientToken: xuid,
                 selectedProfile: {
-                    id: mcUuid,
+                    id: uuidNoDashes,
                     name: mcName
                 }
             },
-            // Let minecraft-protocol validate with Mojang
-            skipValidation: false,
+            // Custom session server
+            sessionServer: 'https://sessionserver.mojang.com',
+            // Skip validation initially, let the server validate
+            skipValidation: true,
             version: false,
             hideErrors: false
         });
@@ -140,7 +140,7 @@ async function createBot(botId, host, port, credentials) {
         });
 
         client.on('success', () => {
-            console.log(`[${botId}] ✅ Session validated!`);
+            console.log(`[${botId}] ✅ Connection success!`);
         });
         
         client.on('login', (packet) => {
@@ -207,7 +207,7 @@ async function createBot(botId, host, port, credentials) {
                             
                             if (queue.length === 0) {
                                 isCollecting = true;
-                                console.log(`[${botId}] 🔄 Queue empty - collecting again`);
+                                console.log(`[${botId}] 🔄 Queue empty`);
                             }
                         } catch (err) {
                             console.error(`[${botId}] ❌ Send failed: ${err.message}`);
@@ -262,7 +262,7 @@ async function createBot(botId, host, port, credentials) {
             isCollecting = true;
             queue.length = 0;
             
-            console.log(`[${botId}] ✅ Force stopped - resuming queue`);
+            console.log(`[${botId}] ✅ Force stopped`);
             startNormalMessaging();
         };
         
@@ -276,20 +276,23 @@ async function createBot(botId, host, port, credentials) {
                 
                 console.error(`[${botId}] 🚫 KICKED: ${reasonText}`);
                 
+                // Check for authentication failure
+                if (reasonText.toLowerCase().includes('not logged') || 
+                    reasonText.toLowerCase().includes('authentication')) {
+                    console.log(`[${botId}] 🔐 AUTH FAILED - Token may be invalid for this server`);
+                    console.log(`[${botId}] 💡 TIP: Server may require fresh session or different auth method`);
+                }
+                
                 if (reasonText.toLowerCase().includes('mute') || 
                     reasonText.toLowerCase().includes('silenced') ||
                     reasonText.toLowerCase().includes('chat')) {
                     console.log(`[${botId}] 🔇 MUTED`);
                     bannedAccounts.add(botId);
-                    bots.delete(botId);
-                    return;
                 }
                 
                 if (reasonText.toLowerCase().includes('ban')) {
                     console.log(`[${botId}] ⛔ BANNED`);
                     bannedAccounts.add(botId);
-                    bots.delete(botId);
-                    return;
                 }
                 
             } catch (err) {
@@ -339,11 +342,11 @@ app.post('/add', async (req, res) => {
     try {
         const { username, token, host = 'donutsmp.net', port = 25565 } = req.body;
         if (!username || !token) {
-            return res.status(400).json({ success: false, error: 'Missing username or token' });
+            return res.status(400).json({ success: false, error: 'Missing data' });
         }
         
         if (bots.has(username)) {
-            return res.status(400).json({ success: false, error: 'Bot already running' });
+            return res.status(400).json({ success: false, error: 'Already running' });
         }
         
         const result = await createBot(username, host, port, token);
@@ -356,7 +359,7 @@ app.post('/add', async (req, res) => {
 app.post('/remove', (req, res) => {
     const { username } = req.body;
     const bot = bots.get(username);
-    if (!bot) return res.status(404).json({ success: false, error: 'Bot not found' });
+    if (!bot) return res.status(404).json({ success: false, error: 'Not found' });
     
     try { bot.client.end(); } catch {}
     bots.delete(username);
@@ -414,8 +417,10 @@ app.get('/health', (req, res) => res.json({ healthy: true }));
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`✅ Bot API on port ${PORT}`);
-    console.log(`🔐 Session Login Mode (XUID auth)`);
+    console.log(`🔐 Session Login Mode (skipValidation)`);
     console.log(`📊 Queue: ${MAX_QUEUE_SIZE}`);
     console.log(`⏱️  Interval: ${MESSAGE_INTERVAL}ms (2.5s)`);
     console.log(`💬 Message: "donut.lat"`);
+    console.log(`\n⚠️  NOTE: Server requires valid Mojang session`);
+    console.log(`   The token must be accepted by Mojang's session servers`);
 });
