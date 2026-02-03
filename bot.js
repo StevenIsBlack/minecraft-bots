@@ -1,20 +1,12 @@
-const mineflayer = require('mineflayer');
-const { Authflow, Titles } = require('prismarine-auth');
+const mc = require('minecraft-protocol');
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
-
 const app = express();
+
 app.use(express.json());
 
 const bots = new Map();
 const bannedAccounts = new Set();
-const CACHE_DIR = './auth_cache';
 const MAX_QUEUE_SIZE = 100;
-
-if (!fs.existsSync(CACHE_DIR)) {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
 
 function parseCredentials(input) {
     const parts = input.split(':');
@@ -34,41 +26,6 @@ function decodeJWT(token) {
         return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
     } catch {
         return null;
-    }
-}
-
-class CachedAuthflow extends Authflow {
-    constructor(username, cacheDir, token, tokenData) {
-        super(username, cacheDir, { authTitle: Titles.MinecraftJava, flow: 'live' });
-        
-        this.token = token;
-        this.tokenData = tokenData;
-        this.profile = {
-            id: tokenData.pfd?.[0]?.id || tokenData.profiles?.mc,
-            name: tokenData.pfd?.[0]?.name
-        };
-        
-        const cacheFile = path.join(cacheDir, `${username}.json`);
-        const cache = {
-            mca: {
-                token: token,
-                obtainedOn: Date.now(),
-                expiresOn: (tokenData.exp || Math.floor(Date.now() / 1000) + 86400) * 1000,
-                profile: this.profile
-            }
-        };
-        
-        try {
-            fs.writeFileSync(cacheFile, JSON.stringify(cache));
-        } catch {}
-    }
-
-    async getMinecraftJavaToken() {
-        return {
-            token: this.token,
-            expiresOn: (this.tokenData.exp || Math.floor(Date.now() / 1000) + 86400) * 1000,
-            profile: this.profile
-        };
     }
 }
 
@@ -114,36 +71,40 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         const mcName = tokenData.pfd?.[0]?.name;
         const mcUuid = tokenData.pfd?.[0]?.id || tokenData.profiles?.mc;
 
-        if (!mcName) throw new Error('No Minecraft profile');
+        if (!mcName || !mcUuid) throw new Error('No Minecraft profile');
 
         console.log(`[${botId}] 👤 ${mcName}`);
+        console.log(`[${botId}] 🆔 ${mcUuid}`);
 
-        const authflow = new CachedAuthflow(creds.email, CACHE_DIR, creds.token, tokenData);
-
-        const client = mineflayer.createBot({
+        // DIRECT SESSION - Like Session Login Mod
+        const client = mc.createClient({
             host: host,
             port: port,
             username: mcName,
-            auth: 'microsoft',
-            authflow: authflow,
-            version: false,
-            hideErrors: false,
+            accessToken: creds.token,
+            clientToken: tokenData.xuid || mcUuid,
+            session: {
+                accessToken: creds.token,
+                clientToken: tokenData.xuid || mcUuid,
+                selectedProfile: {
+                    id: mcUuid,
+                    name: mcName
+                }
+            },
             skipValidation: true,
-            profilesFolder: CACHE_DIR
+            version: false,
+            hideErrors: false
         });
 
         const queue = [];
         const cooldown = new Set();
         let lastSend = 0;
         let isOnline = false;
-        let isMuted = false;
         let reconnectAttempts = 0;
         let queueCycle = 0;
         let isCollecting = true;
         let forceTarget = null;
         let forceSender = null;
-        let messagesSent = 0;
-        let messagesConfirmed = 0;
         
         const botData = {
             client,
@@ -154,99 +115,71 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             host,
             port,
             isOnline: false,
-            isMuted: false,
-            forceTarget: null,
-            messagesSent: 0,
-            messagesConfirmed: 0
+            forceTarget: null
         };
         
-        client.on('login', () => {
-            console.log(`[${botId}] ✅ LOGGED IN as ${mcName}!`);
+        client.on('connect', () => {
+            console.log(`[${botId}] 🔌 Connected to server`);
+        });
+
+        client.on('success', () => {
+            console.log(`[${botId}] ✅ Auth success!`);
+        });
+
+        client.on('session', () => {
+            console.log(`[${botId}] 🎫 Session active`);
+        });
+        
+        client.on('login', (packet) => {
+            console.log(`[${botId}] ✅ LOGGED IN!`);
             isOnline = true;
             botData.isOnline = true;
             reconnectAttempts = 0;
         });
         
-        client.on('spawn', () => {
-            console.log(`[${botId}] 🎮 SPAWNED - Bot is ONLINE and ready!`);
-            
-            // Test message on spawn to verify bot can chat
-            setTimeout(() => {
-                try {
-                    client.chat('/list');
-                    console.log(`[${botId}] ✅ Chat test successful`);
-                } catch (e) {
-                    console.log(`[${botId}] ⚠️  Chat test failed: ${e.message}`);
-                }
-            }, 3000);
+        client.on('spawn_position', () => {
+            console.log(`[${botId}] 🎮 SPAWNED - Ready!`);
         });
         
-        // CRITICAL: Listen for ALL chat messages to detect mutes & errors
-        client.on('messagestr', (message, position) => {
-            const msgLower = message.toLowerCase();
-            
-            // MUTE DETECTION
-            if (msgLower.includes('muted') || 
-                msgLower.includes('you cannot speak') ||
-                msgLower.includes('you are muted') ||
-                msgLower.includes('chat is disabled')) {
+        client.on('chat', (packet) => {
+            try {
+                let text = typeof packet.message === 'string' ? JSON.parse(packet.message) : packet.message;
+                const msg = extractText(text);
                 
-                console.error(`[${botId}] 🔇 MUTED DETECTED - Disconnecting...`);
-                isMuted = true;
-                botData.isMuted = true;
+                if (!msg || msg.includes('[AutoMsg]') || msg.includes('discord.gg') || msg.includes(mcName)) return;
                 
-                // Disconnect muted bot
-                try {
-                    client.end();
-                } catch {}
-                bots.delete(botId);
-                return;
-            }
-            
-            // MESSAGE CONFIRMATION - If server echoes our message back
-            if (msgLower.includes('discord.gg\\bils')) {
-                messagesConfirmed++;
-                botData.messagesConfirmed = messagesConfirmed;
-            }
-            
-            // ERROR DETECTION
-            if (msgLower.includes('no player') || 
-                msgLower.includes('not online') ||
-                msgLower.includes('cannot find')) {
-                console.log(`[${botId}] ⚠️  Player offline or doesn't exist`);
-                return;
-            }
-            
-            // Don't collect during force mode
-            if (forceTarget) return;
-            if (!isCollecting) return;
-            if (message.includes('[AutoMsg]') || message.includes('discord.gg') || message.includes(mcName)) return;
-            
-            const name = parseName(message, mcName);
-            
-            if (name && 
-                !cooldown.has(name) && 
-                !queue.includes(name) &&
-                queue.length < MAX_QUEUE_SIZE) {
+                if (forceTarget) return;
+                if (!isCollecting) return;
                 
-                queue.push(name);
-                console.log(`[${botId}] 📥 ${name} (${queue.length}/${MAX_QUEUE_SIZE})`);
+                const name = parseName(msg, mcName);
                 
-                if (queue.length === MAX_QUEUE_SIZE) {
-                    isCollecting = false;
-                    queueCycle++;
-                    console.log(`[${botId}] 📊 Cycle #${queueCycle} FULL`);
+                if (name && 
+                    !cooldown.has(name) && 
+                    !queue.includes(name) &&
+                    queue.length < MAX_QUEUE_SIZE) {
+                    
+                    queue.push(name);
+                    console.log(`[${botId}] 📥 ${name} (${queue.length}/${MAX_QUEUE_SIZE})`);
+                    
+                    if (queue.length === MAX_QUEUE_SIZE) {
+                        isCollecting = false;
+                        queueCycle++;
+                        console.log(`[${botId}] 📊 Cycle #${queueCycle} FULL - Sending...`);
+                    }
                 }
-            }
+            } catch {}
         });
         
-        // Normal queue sender
+        function extractText(component) {
+            if (typeof component === 'string') return component;
+            if (!component) return '';
+            let text = component.text || '';
+            if (component.extra) component.extra.forEach(e => text += extractText(e));
+            return text;
+        }
+        
         const sender = setInterval(() => {
-            if (!isOnline || !client._client?.socket) return;
-            if (isMuted) {
-                clearInterval(sender);
-                return;
-            }
+            if (!isOnline || !client.socket?.writable) return;
             if (forceTarget) return;
             
             if (queue.length > 0 && !isCollecting) {
@@ -255,10 +188,8 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                     const target = queue.shift();
                     
                     try {
-                        client.chat(`/msg ${target} discord.gg\\bils ${generateRandom()}`);
-                        messagesSent++;
-                        botData.messagesSent = messagesSent;
-                        console.log(`[${botId}] ✅ → ${target} | Queue: ${queue.length} | Sent: ${messagesSent}`);
+                        client.write('chat', { message: `/msg ${target} discord.gg\\bils ${generateRandom()}` });
+                        console.log(`[${botId}] ✅ → ${target} | Left: ${queue.length}`);
                         
                         lastSend = now;
                         cooldown.add(target);
@@ -266,37 +197,30 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                         
                         if (queue.length === 0) {
                             isCollecting = true;
-                            console.log(`[${botId}] 🔄 Cycle done - Collecting...`);
+                            console.log(`[${botId}] 🔄 Cycle #${queueCycle} done`);
                         }
-                    } catch (e) {
-                        console.error(`[${botId}] ❌ Send failed: ${e.message}`);
-                    }
+                    } catch {}
                 }
             }
         }, 100);
         
         botData.startForce = (target) => {
             forceTarget = target;
-            botData.forceTarget = target;
             isCollecting = false;
-            console.log(`[${botId}] 🎯 FORCE MODE → ${target}`);
+            console.log(`[${botId}] 🎯 FORCE → ${target}`);
             
             if (forceSender) clearInterval(forceSender);
             
             forceSender = setInterval(() => {
-                if (!isOnline || !client._client?.socket || !forceTarget || isMuted) {
+                if (!isOnline || !client.socket?.writable || !forceTarget) {
                     if (forceSender) clearInterval(forceSender);
                     return;
                 }
                 
                 try {
-                    client.chat(`/msg ${forceTarget} discord.gg\\bils ${generateRandom()}`);
-                    messagesSent++;
-                    botData.messagesSent = messagesSent;
-                    console.log(`[${botId}] 🎯 FORCE → ${forceTarget} (Total: ${messagesSent})`);
-                } catch (e) {
-                    console.error(`[${botId}] Force failed: ${e.message}`);
-                }
+                    client.write('chat', { message: `/msg ${forceTarget} discord.gg\\bils ${generateRandom()}` });
+                    console.log(`[${botId}] 🎯 → ${forceTarget}`);
+                } catch {}
             }, 2000);
         };
         
@@ -312,16 +236,21 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             console.log(`[${botId}] ✅ Force stopped`);
         };
         
-        client.on('kicked', (reason) => {
+        client.on('kick_disconnect', (packet) => {
             clearInterval(sender);
             if (forceSender) clearInterval(forceSender);
-            console.error(`[${botId}] 🚫 KICKED: ${reason}`);
             
-            const reasonLower = reason.toLowerCase();
-            if (reasonLower.includes('ban') || reasonLower.includes('muted')) {
-                bannedAccounts.add(botId);
-                bots.delete(botId);
-                return;
+            try {
+                const reason = JSON.parse(packet.reason);
+                console.error(`[${botId}] 🚫 KICKED: ${reason.text || JSON.stringify(reason)}`);
+                
+                if ((reason.text || '').toLowerCase().includes('ban')) {
+                    bannedAccounts.add(botId);
+                    bots.delete(botId);
+                    return;
+                }
+            } catch {
+                console.error(`[${botId}] 🚫 KICKED`);
             }
             
             botData.isOnline = false;
@@ -336,17 +265,21 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             }
         });
         
-        client.on('end', () => {
+        client.on('disconnect', (packet) => {
             clearInterval(sender);
             if (forceSender) clearInterval(forceSender);
             console.log(`[${botId}] 🔌 Disconnected`);
             botData.isOnline = false;
         });
+
+        client.on('end', () => {
+            clearInterval(sender);
+            if (forceSender) clearInterval(forceSender);
+            botData.isOnline = false;
+        });
         
         client.on('error', (err) => {
-            if (!err.message.includes('keepalive')) {
-                console.error(`[${botId}] ❌ ${err.message}`);
-            }
+            console.error(`[${botId}] ❌ ${err.message}`);
         });
         
         bots.set(botId, botData);
@@ -394,18 +327,17 @@ app.post('/forcemsg', (req, res) => {
     
     let count = 0;
     bots.forEach((bot) => {
-        if (bot.isOnline && !bot.isMuted && bot.startForce) {
+        if (bot.isOnline && bot.startForce) {
+            bot.forceTarget = target;
             bot.startForce(target);
             count++;
         }
     });
     
-    if (count === 0) {
-        return res.status(400).json({ success: false, error: 'No bots online' });
-    }
+    if (count === 0) return res.status(400).json({ success: false, error: 'No bots online' });
     
     console.log(`🎯 ${count} bots force messaging ${target}`);
-    res.json({ success: true, sent: count, target: target });
+    res.json({ success: true, sent: count, target });
 });
 
 app.post('/stopforce', (req, res) => {
@@ -422,25 +354,8 @@ app.post('/stopforce', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-    const status = Array.from(bots.entries()).map(([id, bot]) => ({
-        id: id,
-        username: bot.mcUsername,
-        online: bot.isOnline,
-        muted: bot.isMuted,
-        queue: bot.queue.length,
-        sent: bot.messagesSent,
-        confirmed: bot.messagesConfirmed,
-        forceTarget: bot.forceTarget
-    }));
-    
-    const onlineCount = status.filter(b => b.online).length;
-    
-    res.json({ 
-        success: true, 
-        total: bots.size,
-        online: onlineCount,
-        bots: status
-    });
+    const onlineCount = Array.from(bots.values()).filter(b => b.isOnline).length;
+    res.json({ success: true, total: bots.size, online: onlineCount });
 });
 
 app.get('/', (req, res) => res.json({ status: 'online', bots: bots.size }));
@@ -449,7 +364,6 @@ app.get('/health', (req, res) => res.json({ healthy: true }));
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`✅ Running on ${PORT}`);
-    console.log(`🎫 Auth: ENABLED`);
-    console.log(`🔇 Mute Detection: ENABLED`);
-    console.log(`📊 Message Tracking: ENABLED`);
+    console.log(`🎫 Direct Session Mode`);
+    console.log(`📊 Queue: 100/cycle`);
 });
