@@ -1,6 +1,5 @@
 const mc = require('minecraft-protocol');
 const express = require('express');
-const { Authflow, Titles } = require('prismarine-auth');
 const app = express();
 
 app.use(express.json());
@@ -11,18 +10,45 @@ const MAX_QUEUE_SIZE = 100;
 const MESSAGE_INTERVAL = 2500; // 2.5 seconds
 
 function parseCredentials(input) {
+    // Support both formats: email:password:token OR just token
     const parts = input.split(':');
-    if (parts.length < 2) throw new Error('Invalid format - use email:password');
-    return {
-        email: parts[0],
-        password: parts[1]
-    };
+    if (parts.length >= 3) {
+        // Format: email:password:token
+        return {
+            token: parts.slice(2).join(':'),
+            email: parts[0]
+        };
+    } else {
+        // Format: just token
+        return {
+            token: input,
+            email: null
+        };
+    }
+}
+
+function decodeJWT(token) {
+    try {
+        const parts = token.split('.');
+        if (parts.length < 2) return null;
+        
+        let payload = parts[1];
+        // Add padding if needed
+        while (payload.length % 4 !== 0) payload += '=';
+        
+        const decoded = Buffer.from(payload, 'base64').toString('utf8');
+        return JSON.parse(decoded);
+    } catch (err) {
+        console.error('JWT decode error:', err.message);
+        return null;
+    }
 }
 
 function parseName(text, myName) {
-    if (!text.includes(':')) return null;
+    if (!text || !text.includes(':')) return null;
     try {
         let name = text.substring(0, text.indexOf(':')).trim();
+        // Remove color codes and brackets
         name = name.replace(/§./g, '').replace(/\[.*?\]/g, '').trim();
         if (name.endsWith('+')) name = name.substring(0, name.length - 1);
         if (name.includes(' ')) name = name.substring(name.lastIndexOf(' ') + 1);
@@ -42,66 +68,46 @@ function extractText(component) {
     return text;
 }
 
-async function authenticateAccount(email, password) {
-    try {
-        console.log(`🔑 Authenticating ${email}...`);
-        
-        const authflow = new Authflow(email, './auth-cache', {
-            authTitle: Titles.MinecraftJava,
-            flow: 'live',
-            password: password
-        });
-        
-        const auth = await authflow.getMinecraftJavaToken({ fetchProfile: true });
-        
-        if (!auth || !auth.profile) {
-            throw new Error('Authentication failed - no profile');
-        }
-        
-        console.log(`✅ Authenticated as ${auth.profile.name}`);
-        
-        return {
-            username: auth.profile.name,
-            uuid: auth.profile.id,
-            accessToken: auth.token,
-            auth: authflow
-        };
-    } catch (error) {
-        console.error(`❌ Auth error: ${error.message}`);
-        throw new Error(`Authentication failed: ${error.message}`);
-    }
-}
-
-async function createBot(botId, host, port, credentials, isReconnect = false) {
+async function createBot(botId, host, port, credentials) {
     try {
         if (bannedAccounts.has(botId)) {
-            return { success: false, error: 'Banned' };
+            return { success: false, error: 'Account is banned/muted' };
         }
 
-        console.log(`[${botId}] ${isReconnect ? '🔄' : '🚀'} Starting...`);
+        console.log(`[${botId}] 🚀 Starting...`);
         
         const creds = parseCredentials(credentials);
+        const tokenData = decodeJWT(creds.token);
+
+        if (!tokenData) {
+            throw new Error('Invalid token - could not decode');
+        }
+
+        // Try different token structures
+        const mcName = tokenData.pfd?.[0]?.name || 
+                      tokenData.selectedProfile?.name || 
+                      tokenData.name;
         
-        // Authenticate automatically
-        const authData = await authenticateAccount(creds.email, creds.password);
+        const mcUuid = tokenData.pfd?.[0]?.id || 
+                      tokenData.selectedProfile?.id || 
+                      tokenData.uuid ||
+                      tokenData.id;
 
-        console.log(`[${botId}] 👤 ${authData.username}`);
-        console.log(`[${botId}] 🆔 ${authData.uuid}`);
+        if (!mcName || !mcUuid) {
+            console.error('Token data:', JSON.stringify(tokenData, null, 2));
+            throw new Error('No Minecraft profile found in token');
+        }
 
-        // Create client with proper auth
+        console.log(`[${botId}] 👤 Username: ${mcName}`);
+        console.log(`[${botId}] 🆔 UUID: ${mcUuid}`);
+
+        // Create client with offline mode (no auth verification needed)
         const client = mc.createClient({
             host: host,
             port: port,
-            username: authData.username,
-            auth: 'microsoft',
-            session: {
-                accessToken: authData.accessToken,
-                selectedProfile: {
-                    id: authData.uuid,
-                    name: authData.username
-                }
-            },
-            version: false, // Auto-detect
+            username: mcName,
+            auth: 'offline', // Use offline mode to avoid verification
+            version: false, // Auto-detect version
             hideErrors: false
         });
 
@@ -117,38 +123,36 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         
         const botData = {
             client,
-            mcUsername: authData.username,
+            mcUsername: mcName,
             queue,
             cooldown,
             credentials,
             host,
             port,
             isOnline: false,
-            forceTarget: null,
-            authData
+            forceTarget: null
         };
         
         client.on('connect', () => {
-            console.log(`[${botId}] 🔌 Connected to server`);
+            console.log(`[${botId}] 🔌 Connected to ${host}:${port}`);
         });
 
         client.on('success', () => {
-            console.log(`[${botId}] ✅ Auth success!`);
+            console.log(`[${botId}] ✅ Connection success!`);
         });
         
         client.on('login', (packet) => {
-            console.log(`[${botId}] ✅ LOGGED IN!`);
+            console.log(`[${botId}] ✅ LOGGED IN as ${mcName}!`);
             isOnline = true;
             botData.isOnline = true;
         });
         
         client.on('spawn_position', () => {
-            console.log(`[${botId}] 🎮 SPAWNED - Starting auto-messaging!`);
-            // Start messaging automatically when spawned
+            console.log(`[${botId}] 🎮 SPAWNED - Auto-messaging started!`);
             startNormalMessaging();
         });
         
-        // Listen to chat to collect player names
+        // Listen to chat for player names
         client.on('chat', (packet) => {
             try {
                 let text = typeof packet.message === 'string' ? JSON.parse(packet.message) : packet.message;
@@ -156,14 +160,14 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                 
                 if (!msg) return;
                 
-                // Log all chat for debugging
+                // Log chat for debugging
                 console.log(`[${botId}] 💬 ${msg}`);
                 
                 // Don't collect if in force mode
                 if (forceTarget) return;
                 if (!isCollecting) return;
                 
-                const name = parseName(msg, authData.username);
+                const name = parseName(msg, mcName);
                 
                 if (name && 
                     !cooldown.has(name) && 
@@ -171,12 +175,12 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                     queue.length < MAX_QUEUE_SIZE) {
                     
                     queue.push(name);
-                    console.log(`[${botId}] 🔥 Added ${name} to queue (${queue.length}/${MAX_QUEUE_SIZE})`);
+                    console.log(`[${botId}] 🔥 Queued: ${name} (${queue.length}/${MAX_QUEUE_SIZE})`);
                     
                     if (queue.length === MAX_QUEUE_SIZE) {
                         isCollecting = false;
                         queueCycle++;
-                        console.log(`[${botId}] 📊 Cycle #${queueCycle} FULL - Will send when ready`);
+                        console.log(`[${botId}] 📊 Cycle #${queueCycle} FULL`);
                     }
                 }
             } catch (err) {
@@ -184,13 +188,13 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             }
         });
         
-        // Normal queue messaging function
+        // Normal messaging function
         function startNormalMessaging() {
             if (normalSender) clearInterval(normalSender);
             
             normalSender = setInterval(() => {
                 if (!isOnline || !client.socket?.writable) return;
-                if (forceTarget) return; // Don't send if in force mode
+                if (forceTarget) return; // Don't send if forcing
                 
                 if (queue.length > 0) {
                     const now = Date.now();
@@ -199,25 +203,25 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                         
                         try {
                             client.write('chat', { message: `/msg ${target} donut.lat` });
-                            console.log(`[${botId}] ✅ → ${target} | Queue: ${queue.length} left`);
+                            console.log(`[${botId}] ✅ Sent to ${target} | Queue: ${queue.length}`);
                             
                             lastSend = now;
                             cooldown.add(target);
-                            setTimeout(() => cooldown.delete(target), 10000); // 10s cooldown
+                            setTimeout(() => cooldown.delete(target), 10000);
                             
                             if (queue.length === 0) {
                                 isCollecting = true;
-                                console.log(`[${botId}] 🔄 Cycle #${queueCycle} complete - collecting names again`);
+                                console.log(`[${botId}] 🔄 Queue empty - collecting again`);
                             }
                         } catch (err) {
-                            console.error(`[${botId}] ❌ Send error: ${err.message}`);
+                            console.error(`[${botId}] ❌ Send failed: ${err.message}`);
                         }
                     }
                 }
-            }, 100); // Check every 100ms
+            }, 100);
         }
         
-        // Force messaging function
+        // Force messaging
         botData.startForce = (target) => {
             // Stop normal messaging
             if (normalSender) {
@@ -225,13 +229,13 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                 normalSender = null;
             }
             
-            // Clear queue and stop collecting
+            // Clear queue
             queue.length = 0;
             isCollecting = false;
             forceTarget = target;
             botData.forceTarget = target;
             
-            console.log(`[${botId}] 🎯 FORCE MODE → ${target} (queue stopped)`);
+            console.log(`[${botId}] 🎯 FORCE MODE → ${target}`);
             
             if (forceSender) clearInterval(forceSender);
             
@@ -248,13 +252,13 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                         console.log(`[${botId}] 🎯 FORCE → ${forceTarget}`);
                         lastSend = now;
                     } catch (err) {
-                        console.error(`[${botId}] ❌ Force send error: ${err.message}`);
+                        console.error(`[${botId}] ❌ Force failed: ${err.message}`);
                     }
                 }
             }, 100);
         };
         
-        // Stop force and resume normal messaging
+        // Stop force mode
         botData.stopForce = () => {
             if (forceSender) {
                 clearInterval(forceSender);
@@ -264,11 +268,10 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             forceTarget = null;
             botData.forceTarget = null;
             isCollecting = true;
-            queue.length = 0; // Clear old queue
+            queue.length = 0;
             
-            console.log(`[${botId}] ✅ Force stopped - resuming normal queue`);
+            console.log(`[${botId}] ✅ Force stopped - resuming queue`);
             
-            // Restart normal messaging
             startNormalMessaging();
         };
         
@@ -280,29 +283,26 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                 const reason = JSON.parse(packet.reason);
                 const reasonText = extractText(reason);
                 
-                console.error(`[${botId}] 🚫 ============ KICKED ============`);
-                console.error(`[${botId}] 📋 Reason: ${reasonText}`);
-                console.error(`[${botId}] ================================`);
+                console.error(`[${botId}] 🚫 KICKED: ${reasonText}`);
                 
                 if (reasonText.toLowerCase().includes('mute') || 
                     reasonText.toLowerCase().includes('silenced') ||
-                    reasonText.toLowerCase().includes('chat') ||
-                    reasonText.toLowerCase().includes('restricted')) {
-                    console.log(`[${botId}] 🔇 Account MUTED`);
+                    reasonText.toLowerCase().includes('chat')) {
+                    console.log(`[${botId}] 🔇 MUTED - Adding to ban list`);
                     bannedAccounts.add(botId);
                     bots.delete(botId);
                     return;
                 }
                 
                 if (reasonText.toLowerCase().includes('ban')) {
-                    console.log(`[${botId}] ⛔ Account BANNED`);
+                    console.log(`[${botId}] ⛔ BANNED`);
                     bannedAccounts.add(botId);
                     bots.delete(botId);
                     return;
                 }
                 
             } catch (err) {
-                console.error(`[${botId}] 🚫 KICKED (couldn't parse reason): ${err.message}`);
+                console.error(`[${botId}] 🚫 KICKED (parse error): ${err.message}`);
             }
             
             botData.isOnline = false;
@@ -328,6 +328,7 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             if (normalSender) clearInterval(normalSender);
             if (forceSender) clearInterval(forceSender);
             botData.isOnline = false;
+            console.log(`[${botId}] 🔚 Connection ended`);
         });
         
         client.on('error', (err) => {
@@ -336,19 +337,25 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         
         bots.set(botId, botData);
         
-        return { success: true, mcUsername: authData.username, uuid: authData.uuid };
+        return { success: true, mcUsername: mcName, uuid: mcUuid };
         
     } catch (error) {
-        console.error(`[${botId}] ❌ ${error.message}`);
+        console.error(`[${botId}] ❌ Failed: ${error.message}`);
         throw error;
     }
 }
 
+// API Endpoints
 app.post('/add', async (req, res) => {
     try {
         const { username, token, host = 'donutsmp.net', port = 25565 } = req.body;
-        if (!username || !token) return res.status(400).json({ success: false, error: 'Missing data' });
-        if (bots.has(username)) return res.status(400).json({ success: false, error: 'Already running' });
+        if (!username || !token) {
+            return res.status(400).json({ success: false, error: 'Missing username or token' });
+        }
+        
+        if (bots.has(username)) {
+            return res.status(400).json({ success: false, error: 'Bot already running' });
+        }
         
         const result = await createBot(username, host, port, token);
         res.json({ success: true, ...result });
@@ -360,7 +367,8 @@ app.post('/add', async (req, res) => {
 app.post('/remove', (req, res) => {
     const { username } = req.body;
     const bot = bots.get(username);
-    if (!bot) return res.status(404).json({ success: false, error: 'Not found' });
+    if (!bot) return res.status(404).json({ success: false, error: 'Bot not found' });
+    
     try { bot.client.end(); } catch {}
     bots.delete(username);
     res.json({ success: true });
@@ -375,7 +383,7 @@ app.post('/stopall', (req, res) => {
 
 app.post('/forcemsg', (req, res) => {
     const { target } = req.body;
-    if (!target) return res.status(400).json({ success: false, error: 'Missing target' });
+    if (!target) return res.status(400).json({ success: false, error: 'Missing target player' });
     
     let count = 0;
     bots.forEach((bot) => {
@@ -385,9 +393,11 @@ app.post('/forcemsg', (req, res) => {
         }
     });
     
-    if (count === 0) return res.status(400).json({ success: false, error: 'No bots online' });
+    if (count === 0) {
+        return res.status(400).json({ success: false, error: 'No bots online' });
+    }
     
-    console.log(`🎯 ${count} bot(s) now force messaging ${target}`);
+    console.log(`🎯 ${count} bot(s) now forcing ${target}`);
     res.json({ success: true, sent: count, target });
 });
 
@@ -400,7 +410,7 @@ app.post('/stopforce', (req, res) => {
         }
     });
     
-    console.log(`✅ Stopped force on ${count} bot(s), resumed queue`);
+    console.log(`✅ Stopped force on ${count} bot(s)`);
     res.json({ success: true, stopped: count });
 });
 
@@ -415,8 +425,8 @@ app.get('/health', (req, res) => res.json({ healthy: true }));
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`✅ Bot API running on port ${PORT}`);
-    console.log(`🔑 Auto-Authentication Mode`);
-    console.log(`📊 Queue: ${MAX_QUEUE_SIZE}/cycle`);
-    console.log(`⏱️  Message interval: ${MESSAGE_INTERVAL}ms`);
+    console.log(`🎮 Offline Mode (Token-based)`);
+    console.log(`📊 Queue size: ${MAX_QUEUE_SIZE}`);
+    console.log(`⏱️  Interval: ${MESSAGE_INTERVAL}ms (2.5s)`);
     console.log(`💬 Message: "donut.lat"`);
 });
