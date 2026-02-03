@@ -55,6 +55,14 @@ function generateRandom() {
     return result;
 }
 
+function extractText(component) {
+    if (typeof component === 'string') return component;
+    if (!component) return '';
+    let text = component.text || '';
+    if (component.extra) component.extra.forEach(e => text += extractText(e));
+    return text;
+}
+
 async function createBot(botId, host, port, credentials, isReconnect = false) {
     try {
         if (bannedAccounts.has(botId)) {
@@ -76,7 +84,6 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         console.log(`[${botId}] 👤 ${mcName}`);
         console.log(`[${botId}] 🆔 ${mcUuid}`);
 
-        // DIRECT SESSION - Like Session Login Mod
         const client = mc.createClient({
             host: host,
             port: port,
@@ -125,10 +132,6 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         client.on('success', () => {
             console.log(`[${botId}] ✅ Auth success!`);
         });
-
-        client.on('session', () => {
-            console.log(`[${botId}] 🎫 Session active`);
-        });
         
         client.on('login', (packet) => {
             console.log(`[${botId}] ✅ LOGGED IN!`);
@@ -138,7 +141,7 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         });
         
         client.on('spawn_position', () => {
-            console.log(`[${botId}] 🎮 SPAWNED - Ready!`);
+            console.log(`[${botId}] 🎮 SPAWNED - Ready to message!`);
         });
         
         client.on('chat', (packet) => {
@@ -169,14 +172,6 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
                 }
             } catch {}
         });
-        
-        function extractText(component) {
-            if (typeof component === 'string') return component;
-            if (!component) return '';
-            let text = component.text || '';
-            if (component.extra) component.extra.forEach(e => text += extractText(e));
-            return text;
-        }
         
         const sender = setInterval(() => {
             if (!isOnline || !client.socket?.writable) return;
@@ -236,39 +231,61 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
             console.log(`[${botId}] ✅ Force stopped`);
         };
         
+        // DETAILED KICK LOGGING
         client.on('kick_disconnect', (packet) => {
             clearInterval(sender);
             if (forceSender) clearInterval(forceSender);
             
             try {
                 const reason = JSON.parse(packet.reason);
-                console.error(`[${botId}] 🚫 KICKED: ${reason.text || JSON.stringify(reason)}`);
+                const reasonText = extractText(reason);
                 
-                if ((reason.text || '').toLowerCase().includes('ban')) {
+                console.error(`[${botId}] 🚫 ============ KICKED ============`);
+                console.error(`[${botId}] 📋 Reason: ${reasonText}`);
+                console.error(`[${botId}] 📋 Raw: ${JSON.stringify(reason)}`);
+                console.error(`[${botId}] ================================`);
+                
+                // Check if it's muted
+                if (reasonText.toLowerCase().includes('mute') || 
+                    reasonText.toLowerCase().includes('silenced') ||
+                    reasonText.toLowerCase().includes('chat') ||
+                    reasonText.toLowerCase().includes('restricted')) {
+                    console.log(`[${botId}] 🔇 Account is MUTED - Cannot join`);
                     bannedAccounts.add(botId);
                     bots.delete(botId);
                     return;
                 }
+                
+                // Check if banned
+                if (reasonText.toLowerCase().includes('ban')) {
+                    console.log(`[${botId}] ⛔ Account BANNED`);
+                    bannedAccounts.add(botId);
+                    bots.delete(botId);
+                    return;
+                }
+                
             } catch {
-                console.error(`[${botId}] 🚫 KICKED`);
+                console.error(`[${botId}] 🚫 KICKED (couldn't parse reason)`);
             }
             
             botData.isOnline = false;
             
-            if (reconnectAttempts < 3) {
-                reconnectAttempts++;
-                setTimeout(() => {
-                    createBot(botId, host, port, credentials, true);
-                }, 10000);
-            } else {
-                bots.delete(botId);
-            }
+            // Don't reconnect - just remove
+            bots.delete(botId);
         });
         
         client.on('disconnect', (packet) => {
             clearInterval(sender);
             if (forceSender) clearInterval(forceSender);
-            console.log(`[${botId}] 🔌 Disconnected`);
+            
+            try {
+                const reason = JSON.parse(packet.reason);
+                const reasonText = extractText(reason);
+                console.log(`[${botId}] 🔌 Disconnected: ${reasonText}`);
+            } catch {
+                console.log(`[${botId}] 🔌 Disconnected`);
+            }
+            
             botData.isOnline = false;
         });
 
@@ -279,7 +296,7 @@ async function createBot(botId, host, port, credentials, isReconnect = false) {
         });
         
         client.on('error', (err) => {
-            console.error(`[${botId}] ❌ ${err.message}`);
+            console.error(`[${botId}] ❌ Error: ${err.message}`);
         });
         
         bots.set(botId, botData);
