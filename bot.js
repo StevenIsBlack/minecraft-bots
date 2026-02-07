@@ -1,269 +1,313 @@
 const mineflayer = require('mineflayer');
+const mc = require('minecraft-protocol');
 const express = require('express');
-const app = express();
+const axios = require('axios');
+const crypto = require('crypto');
 
+const app = express();
 app.use(express.json());
 
 const bots = new Map();
-const bannedAccounts = new Set();
-const MAX_QUEUE_SIZE = 100;
 
-function parseCredentials(input) {
+// Token analyzer
+function analyzeToken(input) {
     const parts = input.split(':');
-    if (parts.length < 3) throw new Error('Invalid format');
-    return {
-        email: parts[0],
-        password: parts[1],
-        token: parts.slice(2).join(':')
-    };
-}
-
-function decodeJWT(token) {
-    try {
-        const parts = token.split('.');
-        let payload = parts[1];
-        while (payload.length % 4 !== 0) payload += '=';
-        return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
-    } catch {
-        return null;
-    }
-}
-
-function parseName(text, myName) {
-    if (!text.includes(':')) return null;
-    try {
-        let name = text.substring(0, text.indexOf(':')).trim();
-        name = name.replace(/§./g, '').replace(/\[.*?\]/g, '').trim();
-        if (name.endsWith('+')) name = name.substring(0, name.length - 1);
-        if (name.includes(' ')) name = name.substring(name.lastIndexOf(' ') + 1);
-        if (name.length < 3 || name.length > 16) return null;
-        if (name.toLowerCase() === myName.toLowerCase()) return null;
-        return name;
-    } catch {
-        return null;
-    }
-}
-
-function generateRandom() {
-    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    const len = 5 + Math.floor(Math.random() * 5);
-    let result = '';
-    for (let i = 0; i < len * 2 + 1; i++) {
-        if (i === len) result += ' ';
-        else result += chars[Math.floor(Math.random() * chars.length)];
-    }
-    return result;
-}
-
-function extractText(component) {
-    if (typeof component === 'string') return component;
-    if (!component) return '';
-    let text = component.text || '';
-    if (component.extra) component.extra.forEach(e => text += extractText(e));
-    return text;
-}
-
-async function createBot(botId, host, port, credentials, isReconnect = false) {
-    try {
-        if (bannedAccounts.has(botId)) {
-            return { success: false, error: 'Banned' };
-        }
-
-        console.log(`[${botId}] ${isReconnect ? '🔄' : '🚀'} Starting...`);
+    
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('🔍 TOKEN ANALYSIS');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`Parts: ${parts.length}`);
+    console.log(`Part 1 (email): ${parts[0]}`);
+    console.log(`Part 2 (password): ${parts[1]?.substring(0, 3)}***`);
+    console.log(`Part 3 (token): ${parts[2]?.substring(0, 20)}...`);
+    console.log(`Token length: ${parts[2]?.length || 0}`);
+    
+    // Check if it's a JWT
+    const token = parts[2];
+    if (token && token.includes('.')) {
+        const tokenParts = token.split('.');
+        console.log(`Token format: JWT-like (${tokenParts.length} parts)`);
         
-        const creds = parseCredentials(credentials);
-        const tokenData = decodeJWT(creds.token);
+        try {
+            // Decode JWT
+            let payload = tokenParts[1];
+            while (payload.length % 4 !== 0) payload += '=';
+            const decoded = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+            
+            console.log('📋 Decoded JWT:');
+            console.log(JSON.stringify(decoded, null, 2));
+            
+            return {
+                type: 'jwt',
+                email: parts[0],
+                password: parts[1],
+                token: token,
+                decoded: decoded
+            };
+        } catch (e) {
+            console.log('⚠️ Failed to decode as JWT:', e.message);
+        }
+    }
+    
+    // Check if it's a simple bearer token
+    if (token && !token.includes('.')) {
+        console.log('Token format: Bearer/Simple token');
+        return {
+            type: 'bearer',
+            email: parts[0],
+            password: parts[1],
+            token: token
+        };
+    }
+    
+    return null;
+}
 
-        if (!tokenData) throw new Error('Invalid token');
+// Method 1: Direct minecraft-protocol with session injection
+async function tryMethod1(botId, host, port, authData) {
+    console.log(`[${botId}] 🔧 METHOD 1: Direct protocol + session injection`);
+    
+    try {
+        const { decoded, token } = authData;
+        const mcName = decoded.pfd?.[0]?.name || decoded.name || authData.email.split('@')[0];
+        const mcUuid = decoded.pfd?.[0]?.id || decoded.sub || crypto.randomUUID();
+        
+        const client = mc.createClient({
+            host: host,
+            port: port,
+            username: mcName,
+            accessToken: token,
+            clientToken: decoded.xuid || decoded.aid || mcUuid,
+            skipValidation: true,
+            version: false
+        });
+        
+        return { client, mcName };
+    } catch (e) {
+        console.error(`[${botId}] ❌ Method 1 failed:`, e.message);
+        throw e;
+    }
+}
 
-        const mcName = tokenData.pfd?.[0]?.name;
-        const mcUuid = tokenData.pfd?.[0]?.id || tokenData.profiles?.mc;
-
-        if (!mcName || !mcUuid) throw new Error('No Minecraft profile');
-
-        console.log(`[${botId}] 👤 ${mcName}`);
-        console.log(`[${botId}] 🆔 ${mcUuid}`);
-
-        // EXACTLY like Session Login Mod
+// Method 2: Mineflayer offline mode
+async function tryMethod2(botId, host, port, authData) {
+    console.log(`[${botId}] 🔧 METHOD 2: Offline mode`);
+    
+    try {
+        const { decoded } = authData;
+        const mcName = decoded.pfd?.[0]?.name || decoded.name || authData.email.split('@')[0];
+        
         const client = mineflayer.createBot({
             host: host,
             port: port,
-            username: creds.email, // Use EMAIL as username
-            password: creds.password, // Use PASSWORD
-            auth: 'microsoft', // Microsoft auth
-            version: false,
-            hideErrors: false,
-            skipValidation: false // DON'T skip validation
-        });
-
-        const queue = [];
-        const cooldown = new Set();
-        let lastSend = 0;
-        let isOnline = false;
-        let reconnectAttempts = 0;
-        let queueCycle = 0;
-        let isCollecting = true;
-        let forceTarget = null;
-        let forceSender = null;
-        
-        const botData = {
-            client,
-            mcUsername: mcName,
-            queue,
-            cooldown,
-            credentials,
-            host,
-            port,
-            isOnline: false,
-            forceTarget: null
-        };
-        
-        client.on('login', () => {
-            console.log(`[${botId}] ✅ LOGGED IN as ${client.username}!`);
-            isOnline = true;
-            botData.isOnline = true;
-            reconnectAttempts = 0;
+            username: mcName,
+            auth: 'offline',
+            version: false
         });
         
-        client.on('spawn', () => {
-            console.log(`[${botId}] 🎮 SPAWNED!`);
-        });
-        
-        client.on('messagestr', (message) => {
-            if (message.includes('[AutoMsg]') || message.includes('discord.gg') || message.includes(mcName)) return;
-            
-            if (forceTarget) return;
-            if (!isCollecting) return;
-            
-            const name = parseName(message, mcName);
-            
-            if (name && 
-                !cooldown.has(name) && 
-                !queue.includes(name) &&
-                queue.length < MAX_QUEUE_SIZE) {
-                
-                queue.push(name);
-                console.log(`[${botId}] 📥 ${name} (${queue.length}/${MAX_QUEUE_SIZE})`);
-                
-                if (queue.length === MAX_QUEUE_SIZE) {
-                    isCollecting = false;
-                    queueCycle++;
-                    console.log(`[${botId}] 📊 Cycle #${queueCycle} FULL`);
-                }
-            }
-        });
-        
-        const sender = setInterval(() => {
-            if (!isOnline) return;
-            if (forceTarget) return;
-            
-            if (queue.length > 0 && !isCollecting) {
-                const now = Date.now();
-                if (now - lastSend >= 2000) {
-                    const target = queue.shift();
-                    
-                    try {
-                        client.chat(`/msg ${target} discord.gg\\bils ${generateRandom()}`);
-                        console.log(`[${botId}] ✅ → ${target} | Left: ${queue.length}`);
-                        
-                        lastSend = now;
-                        cooldown.add(target);
-                        setTimeout(() => cooldown.delete(target), 5000);
-                        
-                        if (queue.length === 0) {
-                            isCollecting = true;
-                            console.log(`[${botId}] 🔄 Cycle #${queueCycle} done`);
-                        }
-                    } catch {}
-                }
-            }
-        }, 100);
-        
-        botData.startForce = (target) => {
-            forceTarget = target;
-            isCollecting = false;
-            console.log(`[${botId}] 🎯 FORCE → ${target}`);
-            
-            if (forceSender) clearInterval(forceSender);
-            
-            forceSender = setInterval(() => {
-                if (!isOnline || !forceTarget) {
-                    if (forceSender) clearInterval(forceSender);
-                    return;
-                }
-                
-                try {
-                    client.chat(`/msg ${forceTarget} discord.gg\\bils ${generateRandom()}`);
-                    console.log(`[${botId}] 🎯 → ${forceTarget}`);
-                } catch {}
-            }, 2000);
-        };
-        
-        botData.stopForce = () => {
-            if (forceSender) {
-                clearInterval(forceSender);
-                forceSender = null;
-            }
-            forceTarget = null;
-            botData.forceTarget = null;
-            isCollecting = true;
-            queue.length = 0;
-            console.log(`[${botId}] ✅ Force stopped`);
-        };
-        
-        client.on('kicked', (reason) => {
-            clearInterval(sender);
-            if (forceSender) clearInterval(forceSender);
-            
-            console.error(`[${botId}] 🚫 KICKED: ${reason}`);
-            
-            if (reason.toLowerCase().includes('mute') || reason.toLowerCase().includes('ban')) {
-                bannedAccounts.add(botId);
-            }
-            
-            bots.delete(botId);
-        });
-        
-        client.on('end', () => {
-            clearInterval(sender);
-            if (forceSender) clearInterval(forceSender);
-            botData.isOnline = false;
-        });
-        
-        client.on('error', (err) => {
-            console.error(`[${botId}] ❌ ${err.message}`);
-        });
-        
-        bots.set(botId, botData);
-        
-        return { success: true, mcUsername: mcName, uuid: mcUuid };
-        
-    } catch (error) {
-        console.error(`[${botId}] ❌ ${error.message}`);
-        throw error;
+        return { client, mcName };
+    } catch (e) {
+        console.error(`[${botId}] ❌ Method 2 failed:`, e.message);
+        throw e;
     }
+}
+
+// Method 3: Custom auth with token as password
+async function tryMethod3(botId, host, port, authData) {
+    console.log(`[${botId}] 🔧 METHOD 3: Token as username`);
+    
+    try {
+        const client = mc.createClient({
+            host: host,
+            port: port,
+            username: authData.token,
+            skipValidation: true,
+            version: false
+        });
+        
+        return { client, mcName: authData.token.substring(0, 16) };
+    } catch (e) {
+        console.error(`[${botId}] ❌ Method 3 failed:`, e.message);
+        throw e;
+    }
+}
+
+// Method 4: Raw protocol with custom auth server
+async function tryMethod4(botId, host, port, authData) {
+    console.log(`[${botId}] 🔧 METHOD 4: Custom auth server (TheAltening-style)`);
+    
+    try {
+        const { decoded, token } = authData;
+        const mcName = decoded.pfd?.[0]?.name || decoded.name || authData.email.split('@')[0];
+        
+        const client = mc.createClient({
+            host: host,
+            port: port,
+            username: mcName,
+            accessToken: token,
+            auth: 'mojang',
+            skipValidation: true,
+            version: false,
+            sessionServer: 'https://sessionserver.mojang.com',
+            // Try using token as-is
+        });
+        
+        return { client, mcName };
+    } catch (e) {
+        console.error(`[${botId}] ❌ Method 4 failed:`, e.message);
+        throw e;
+    }
+}
+
+// Method 5: HTTP-based auth (custom authentication server)
+async function tryMethod5(botId, host, port, authData) {
+    console.log(`[${botId}] 🔧 METHOD 5: HTTP-based custom auth`);
+    
+    try {
+        const { token, email, decoded } = authData;
+        
+        // Try to validate token with Mojang/Microsoft
+        const authResponse = await axios.post('https://api.minecraftservices.com/minecraft/profile', {}, {
+            headers: {
+                'Authorization': `Bearer ${token}`
+            },
+            validateStatus: () => true
+        });
+        
+        console.log(`Auth response status: ${authResponse.status}`);
+        
+        if (authResponse.status === 200) {
+            const profile = authResponse.data;
+            console.log('✅ Got profile:', profile);
+            
+            const client = mc.createClient({
+                host: host,
+                port: port,
+                username: profile.name,
+                accessToken: token,
+                clientToken: profile.id,
+                skipValidation: true,
+                version: false
+            });
+            
+            return { client, mcName: profile.name };
+        } else {
+            throw new Error(`Auth failed with status ${authResponse.status}`);
+        }
+    } catch (e) {
+        console.error(`[${botId}] ❌ Method 5 failed:`, e.message);
+        throw e;
+    }
+}
+
+// Method 6: Email/Password only (ignore token)
+async function tryMethod6(botId, host, port, authData) {
+    console.log(`[${botId}] 🔧 METHOD 6: Email/Password auth (ignore token)`);
+    
+    try {
+        const client = mineflayer.createBot({
+            host: host,
+            port: port,
+            username: authData.email,
+            password: authData.password,
+            auth: 'microsoft',
+            version: false
+        });
+        
+        return { client, mcName: authData.email };
+    } catch (e) {
+        console.error(`[${botId}] ❌ Method 6 failed:`, e.message);
+        throw e;
+    }
+}
+
+// Try all methods sequentially
+async function tryAllMethods(botId, host, port, credentials) {
+    console.log(`[${botId}] 🚀 Starting multi-method authentication...`);
+    
+    const authData = analyzeToken(credentials);
+    if (!authData) {
+        throw new Error('Failed to parse credentials');
+    }
+    
+    const methods = [
+        { name: 'Direct Protocol', fn: tryMethod1 },
+        { name: 'Offline Mode', fn: tryMethod2 },
+        { name: 'Token Username', fn: tryMethod3 },
+        { name: 'Custom Auth Server', fn: tryMethod4 },
+        { name: 'HTTP Auth', fn: tryMethod5 },
+        { name: 'Email/Password', fn: tryMethod6 }
+    ];
+    
+    for (const method of methods) {
+        try {
+            console.log(`\n[${botId}] 🔄 Trying: ${method.name}`);
+            const result = await method.fn(botId, host, port, authData);
+            
+            if (result && result.client) {
+                console.log(`[${botId}] ✅ ${method.name} WORKED!`);
+                setupBot(botId, result.client, result.mcName);
+                return result;
+            }
+        } catch (e) {
+            console.log(`[${botId}] ❌ ${method.name} failed, trying next...`);
+            continue;
+        }
+    }
+    
+    throw new Error('All authentication methods failed');
+}
+
+function setupBot(botId, client, mcName) {
+    const botData = {
+        client,
+        mcUsername: mcName,
+        isOnline: false
+    };
+    
+    client.on('connect', () => {
+        console.log(`[${botId}] 🔌 Connected`);
+    });
+    
+    client.on('login', () => {
+        console.log(`[${botId}] ✅ LOGGED IN as ${mcName}!`);
+        botData.isOnline = true;
+    });
+    
+    client.on('spawn', () => {
+        console.log(`[${botId}] 🎮 SPAWNED!`);
+    });
+    
+    client.on('kick_disconnect', (packet) => {
+        try {
+            const reason = JSON.parse(packet.reason);
+            console.error(`[${botId}] 🚫 KICKED: ${JSON.stringify(reason)}`);
+        } catch {
+            console.error(`[${botId}] 🚫 KICKED`);
+        }
+    });
+    
+    client.on('disconnect', (packet) => {
+        console.log(`[${botId}] 🔌 Disconnected`);
+    });
+    
+    client.on('error', (err) => {
+        console.error(`[${botId}] ❌ ${err.message}`);
+    });
+    
+    bots.set(botId, botData);
 }
 
 app.post('/add', async (req, res) => {
     try {
         const { username, token, host = 'donutsmp.net', port = 25565 } = req.body;
         if (!username || !token) return res.status(400).json({ success: false, error: 'Missing data' });
-        if (bots.has(username)) return res.status(400).json({ success: false, error: 'Already running' });
         
-        const result = await createBot(username, host, port, token);
-        res.json({ success: true, ...result });
+        const result = await tryAllMethods(username, host, port, token);
+        res.json({ success: true, mcUsername: result.mcName });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
-});
-
-app.post('/remove', (req, res) => {
-    const { username } = req.body;
-    const bot = bots.get(username);
-    if (!bot) return res.status(404).json({ success: false, error: 'Not found' });
-    try { bot.client.end(); } catch {}
-    bots.delete(username);
-    res.json({ success: true });
 });
 
 app.post('/stopall', (req, res) => {
@@ -273,49 +317,12 @@ app.post('/stopall', (req, res) => {
     res.json({ success: true, stopped: count });
 });
 
-app.post('/forcemsg', (req, res) => {
-    const { target } = req.body;
-    if (!target) return res.status(400).json({ success: false, error: 'Missing target' });
-    
-    let count = 0;
-    bots.forEach((bot) => {
-        if (bot.isOnline && bot.startForce) {
-            bot.forceTarget = target;
-            bot.startForce(target);
-            count++;
-        }
-    });
-    
-    if (count === 0) return res.status(400).json({ success: false, error: 'No bots online' });
-    
-    console.log(`🎯 ${count} bots force messaging ${target}`);
-    res.json({ success: true, sent: count, target });
-});
-
-app.post('/stopforce', (req, res) => {
-    let count = 0;
-    bots.forEach((bot) => {
-        if (bot.forceTarget && bot.stopForce) {
-            bot.stopForce();
-            count++;
-        }
-    });
-    
-    console.log(`✅ Stopped force on ${count} bots`);
-    res.json({ success: true, stopped: count });
-});
-
 app.get('/status', (req, res) => {
-    const onlineCount = Array.from(bots.values()).filter(b => b.isOnline).length;
-    res.json({ success: true, total: bots.size, online: onlineCount });
+    const online = Array.from(bots.values()).filter(b => b.isOnline).length;
+    res.json({ success: true, total: bots.size, online });
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', bots: bots.size }));
-app.get('/health', (req, res) => res.json({ healthy: true }));
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-    console.log(`✅ Running on ${PORT}`);
-    console.log(`🎫 Email/Password Auth`);
-    console.log(`📊 Queue: 100/cycle`);
+app.listen(8080, () => {
+    console.log('✅ Multi-Auth Bot System Running on 8080');
+    console.log('🔬 Will try 6 different authentication methods');
 });
