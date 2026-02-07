@@ -7,7 +7,9 @@
   },
   "dependencies": {
     "mineflayer": "^4.20.1",
-    "express": "^4.18.2"
+    "minecraft-protocol": "^1.44.0",
+    "express": "^4.18.2",
+    "axios": "^1.6.5"
   },
   "engines": {
     "node": ">=18.0.0"
