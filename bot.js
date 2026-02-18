@@ -1,5 +1,4 @@
 const mineflayer = require('mineflayer');
-const { Authflow, Titles } = require('prismarine-auth');
 const express = require('express');
 const { pathfinder } = require('mineflayer-pathfinder');
 const app = express();
@@ -10,55 +9,28 @@ const forceTargets = new Map();
 
 const SERVER_HOST = process.env.MC_HOST || 'DonutSMP.net';
 const SERVER_PORT = parseInt(process.env.MC_PORT || '25565');
-const VERSION = process.env.MC_VERSION || '1.20.1';
+const VERSION = '1.21.5';
 
-// Extract username and create auth from Microsoft JWT token
-async function createAuthFromToken(jwtToken) {
+function parseToken(jwtToken) {
     try {
-        // Decode JWT to get username
         const payload = JSON.parse(Buffer.from(jwtToken.split('.')[1], 'base64').toString());
-        const username = payload.pfd?.[0]?.name || null;
-        const uuid = payload.pfd?.[0]?.id || null;
-        
-        if (!username) {
-            throw new Error('Could not extract username from token');
-        }
-        
-        console.log(`Extracted username: ${username}, UUID: ${uuid}`);
-        
-        // Create a custom auth flow that uses the provided token
-        const authflow = new Authflow(username, './auth_cache', {
-            authTitle: Titles.MinecraftJava,
-            flow: 'live',
-            // Inject the existing Microsoft token
-            getMsaToken: async () => ({
-                token: jwtToken,
-                expires_on: Date.now() + 86400000 // 24 hours
-            })
-        });
-        
-        return { authflow, username, uuid };
-        
+        const username = payload.pfd?.[0]?.name;
+        const uuid = payload.pfd?.[0]?.id?.replace(/-/g, '');
+        return { username, uuid, token: jwtToken };
     } catch (e) {
-        console.error('Token parse error:', e);
-        throw new Error(`Invalid token format: ${e.message}`);
+        throw new Error('Invalid JWT token');
     }
 }
 
 function createBot(jwtToken, botId) {
-    return new Promise(async (resolve, reject) => {
-        console.log(`[${botId}] Processing authentication...`);
+    return new Promise((resolve, reject) => {
+        const auth = parseToken(jwtToken);
+        const mcUsername = auth.username || `Bot_${botId}`;
+        const mcUuid = auth.uuid || '00000000000000000000000000000000';
         
-        let auth;
-        try {
-            auth = await createAuthFromToken(jwtToken);
-        } catch (e) {
-            return reject(e);
-        }
-        
-        const mcUsername = auth.username;
-        console.log(`[${botId}] MC Username: ${mcUsername}`);
-        console.log(`[${botId}] Connecting to ${SERVER_HOST}:${SERVER_PORT} (${VERSION})`);
+        console.log(`[${botId}] Username: ${mcUsername}`);
+        console.log(`[${botId}] UUID: ${mcUuid}`);
+        console.log(`[${botId}] Connecting to ${SERVER_HOST}:${SERVER_PORT} v${VERSION}`);
 
         let spawned = false;
         let bot;
@@ -69,8 +41,17 @@ function createBot(jwtToken, botId) {
                 port: SERVER_PORT,
                 version: VERSION,
                 username: mcUsername,
+                // CRITICAL: Pass the session directly - no interactive auth
+                session: {
+                    accessToken: jwtToken,
+                    clientToken: mcUuid,
+                    selectedProfile: {
+                        id: mcUuid,
+                        name: mcUsername
+                    }
+                },
                 auth: 'microsoft',
-                authflow: auth.authflow, // Use our custom authflow with token
+                skipValidation: true, // Skip Microsoft validation
                 hideErrors: false,
                 checkTimeoutInterval: 60000,
             });
@@ -78,7 +59,7 @@ function createBot(jwtToken, botId) {
             bot.loadPlugin(pathfinder);
             
         } catch (err) {
-            return reject(new Error(`Bot creation failed: ${err.message}`));
+            return reject(new Error(`Failed: ${err.message}`));
         }
 
         const botData = {
@@ -92,7 +73,7 @@ function createBot(jwtToken, botId) {
             spawned = true;
             botData.username = bot.username;
             botData.online = true;
-            console.log(`✅ [${botId}] ${botData.username} spawned!`);
+            console.log(`✅ [${botId}] ${botData.username} joined!`);
             startMessagingCycle(botData);
             resolve(botData);
         });
@@ -112,11 +93,10 @@ function createBot(jwtToken, botId) {
         });
 
         bot.on('end', (reason) => {
-            console.log(`🔌 [${botId}] Disconnected: ${reason}`);
+            console.log(`🔌 [${botId}] Disconnected`);
             botData.online = false;
             clearInterval(botData.messageInterval);
             botData.reconnectTimeout = setTimeout(async () => {
-                console.log(`🔄 [${botId}] Reconnecting...`);
                 try {
                     const newData = await createBot(jwtToken, botId);
                     bots.set(botId, newData);
@@ -129,7 +109,7 @@ function createBot(jwtToken, botId) {
         setTimeout(() => {
             if (!spawned) {
                 try { bot.quit(); } catch {}
-                reject(new Error('Timeout - bot did not spawn'));
+                reject(new Error('Timeout'));
             }
         }, 60000);
     });
@@ -139,18 +119,17 @@ function startMessagingCycle(botData) {
     clearInterval(botData.messageInterval);
     botData.messageInterval = setInterval(() => {
         if (!botData.online) return;
-        const now = Date.now();
-        if (now - botData.lastMessage < 7000) return;
+        if (Date.now() - botData.lastMessage < 7000) return;
         
         const forceTarget = forceTargets.get('global');
         if (forceTarget) {
-            sendMessage(botData, `/msg ${forceTarget} Hey! DonutMarket has cheap items!`);
+            sendMessage(botData, `/msg ${forceTarget} DonutMarket has cheap items!`);
             return;
         }
         
         if (botData.messageQueue.length > 0) {
             const target = botData.messageQueue.shift();
-            sendMessage(botData, `/msg ${target} Hey! DonutMarket has cheap items!`);
+            sendMessage(botData, `/msg ${target} DonutMarket has cheap items!`);
         }
     }, 8000);
 }
@@ -161,18 +140,14 @@ function sendMessage(botData, message) {
             botData.bot.chat(message);
             botData.lastMessage = Date.now();
         }
-    } catch (err) {
-        console.error(`[${botData.id}] Send failed: ${err.message}`);
-    }
+    } catch {}
 }
 
-// API
 app.post('/add', async (req, res) => {
     const { token, username } = req.body;
     const botId = username || `bot_${Date.now()}`;
     if (!token) return res.status(400).json({ error: 'Token required' });
     if (bots.has(botId)) return res.status(400).json({ error: 'Bot exists' });
-    
     try {
         const botData = await createBot(token, botId);
         bots.set(botId, botData);
@@ -183,11 +158,11 @@ app.post('/add', async (req, res) => {
 });
 
 app.post('/remove', (req, res) => {
-    const botData = bots.get(req.body.username);
-    if (!botData) return res.status(404).json({ error: 'Not found' });
-    clearTimeout(botData.reconnectTimeout);
-    clearInterval(botData.messageInterval);
-    try { botData.bot.quit(); } catch {}
+    const b = bots.get(req.body.username);
+    if (!b) return res.status(404).json({ error: 'Not found' });
+    clearTimeout(b.reconnectTimeout);
+    clearInterval(b.messageInterval);
+    try { b.bot.quit(); } catch {}
     bots.delete(req.body.username);
     res.json({ success: true });
 });
@@ -214,7 +189,7 @@ app.post('/forcemsg', (req, res) => {
 
 app.post('/stopforce', (req, res) => {
     forceTargets.clear();
-    res.json({ success: true, stopped: bots.size });
+    res.json({ success: true });
 });
 
 app.get('/status', (req, res) => {
@@ -224,4 +199,4 @@ app.get('/status', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Bot API on ${PORT} | ${SERVER_HOST}:${SERVER_PORT}`));
+app.listen(PORT, () => console.log(`🚀 Bot API on ${PORT} | ${SERVER_HOST} v${VERSION}`));
