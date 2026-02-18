@@ -11,39 +11,45 @@ const SERVER_HOST = process.env.MC_HOST || 'DonutSMP.net';
 const SERVER_PORT = parseInt(process.env.MC_PORT || '25565');
 const VERSION = process.env.MC_VERSION || '1.20.1';
 
-// Parse the token format: "email:password:accessToken"
+// Parse the token format: "email:password:accessToken" OR just "accessToken"
 function parseAuthString(authString) {
-    const parts = authString.split(':');
+    // First, try to decode as JWT to get username
+    let username = null;
+    let tokenPart = authString;
     
-    if (parts.length < 3) {
-        // Just a token or username
-        return { type: 'token', value: authString };
+    // Check if it's the full format with email:password:token
+    if (authString.includes('@') && authString.split(':').length >= 3) {
+        const parts = authString.split(':');
+        tokenPart = parts.slice(2).join(':'); // Token is everything after email:password
     }
     
-    const email = parts[0];
-    const password = parts[1];
-    const token = parts.slice(2).join(':'); // Token may contain colons
-    
-    // Decode the JWT to get username
-    let username = null;
+    // Now decode the JWT token to extract username
     try {
-        const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
-        if (payload.pfd && payload.pfd[0] && payload.pfd[0].name) {
-            username = payload.pfd[0].name;
+        // JWT format: header.payload.signature
+        const parts = tokenPart.split('.');
+        if (parts.length === 3) {
+            const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+            console.log('JWT decoded successfully');
+            
+            // Extract username from pfd array
+            if (payload.pfd && payload.pfd[0] && payload.pfd[0].name) {
+                username = payload.pfd[0].name;
+                console.log('Found username in JWT:', username);
+            }
         }
     } catch (e) {
-        console.error('Failed to decode token:', e.message);
+        console.error('Failed to decode JWT:', e.message);
     }
     
-    return { type: 'full', email, password, token, username };
+    return { username, token: tokenPart };
 }
 
 function createBot(authString, botId) {
     return new Promise((resolve, reject) => {
         const auth = parseAuthString(authString);
-        const mcUsername = auth.username || auth.value || `Bot_${botId}`;
+        const mcUsername = auth.username || `Bot_${botId}`;
         
-        console.log(`[${botId}] Username: ${mcUsername}`);
+        console.log(`[${botId}] Minecraft Username: ${mcUsername}`);
         console.log(`[${botId}] Connecting to ${SERVER_HOST}:${SERVER_PORT} (${VERSION})`);
 
         let spawned = false;
