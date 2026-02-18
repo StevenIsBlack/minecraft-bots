@@ -1,5 +1,6 @@
 const mineflayer = require('mineflayer');
 const express = require('express');
+const { pathfinder } = require('mineflayer-pathfinder');
 const app = express();
 app.use(express.json());
 
@@ -10,84 +11,95 @@ const SERVER_HOST = process.env.MC_HOST || 'DonutSMP.net';
 const SERVER_PORT = parseInt(process.env.MC_PORT || '25565');
 const VERSION = process.env.MC_VERSION || '1.20.1';
 
-// Token format can be:
-// 1. "email:password:accessToken" → extract accessToken
-// 2. Just the raw accessToken
-function parseToken(input) {
-    const parts = input.split(':');
-    if (parts.length >= 3) {
-        // email:password:token - return just the token (last part)
-        return parts.slice(2).join(':');
+// Parse the token format: "email:password:accessToken"
+function parseAuthString(authString) {
+    const parts = authString.split(':');
+    
+    if (parts.length < 3) {
+        // Just a token or username
+        return { type: 'token', value: authString };
     }
-    return input;
-}
-
-function getBotUsername(accessToken) {
-    // Decode JWT to get the username
+    
+    const email = parts[0];
+    const password = parts[1];
+    const token = parts.slice(2).join(':'); // Token may contain colons
+    
+    // Decode the JWT to get username
+    let username = null;
     try {
-        const payload = accessToken.split('.')[1];
-        const decoded = JSON.parse(Buffer.from(payload, 'base64').toString());
-        // Get username from pfd array
-        if (decoded.pfd && decoded.pfd[0] && decoded.pfd[0].name) {
-            return decoded.pfd[0].name;
+        const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+        if (payload.pfd && payload.pfd[0] && payload.pfd[0].name) {
+            username = payload.pfd[0].name;
         }
-    } catch {}
-    return null;
+    } catch (e) {
+        console.error('Failed to decode token:', e.message);
+    }
+    
+    return { type: 'full', email, password, token, username };
 }
 
-function createBot(rawToken, botId) {
+function createBot(authString, botId) {
     return new Promise((resolve, reject) => {
-        const accessToken = parseToken(rawToken);
-        const mcUsername = getBotUsername(accessToken) || `Bot_${botId}`;
+        const auth = parseAuthString(authString);
+        const mcUsername = auth.username || auth.value || `Bot_${botId}`;
         
-        console.log(`[${botId}] Username from token: ${mcUsername}`);
-        console.log(`[${botId}] Connecting to ${SERVER_HOST}:${SERVER_PORT} v${VERSION}...`);
+        console.log(`[${botId}] Username: ${mcUsername}`);
+        console.log(`[${botId}] Connecting to ${SERVER_HOST}:${SERVER_PORT} (${VERSION})`);
 
-        let bot;
         let spawned = false;
+        let bot;
 
         try {
-            bot = mineflayer.createBot({
+            // Critical: Use the exact mineflayer setup
+            const botOptions = {
                 host: SERVER_HOST,
                 port: SERVER_PORT,
                 version: VERSION,
-                auth: 'microsoft',
                 username: mcUsername,
-                profilesFolder: false,
-                logErrors: true,
+                // Key: DonutSMP accepts offline mode with valid usernames
+                auth: 'offline',
                 hideErrors: false,
                 checkTimeoutInterval: 60000,
-            });
+                // Client brand for better compatibility
+                brand: 'vanilla',
+            };
 
-            // Inject access token directly into client before auth handshake
-            bot._client.on('connect', () => {
-                console.log(`[${botId}] TCP connected, injecting token...`);
-                bot._client.session = {
-                    accessToken: accessToken,
-                    selectedProfile: {
-                        id: '14cdeeae9e734f18aae8856ba7776654',
-                        name: mcUsername
-                    }
-                };
-            });
-
+            bot = mineflayer.createBot(botOptions);
+            
+            // Load pathfinder for movement (matches your friend's setup)
+            bot.loadPlugin(pathfinder);
+            
         } catch (err) {
             return reject(new Error(`Failed to create bot: ${err.message}`));
         }
 
         const botData = {
-            bot, id: botId, token: rawToken,
-            username: mcUsername, online: false,
-            messageQueue: [], messageInterval: null, reconnectTimeout: null
+            bot,
+            id: botId,
+            auth: authString,
+            username: mcUsername,
+            online: false,
+            messageQueue: [],
+            messageInterval: null,
+            reconnectTimeout: null,
+            lastMessage: 0
         };
 
         bot.once('spawn', () => {
             spawned = true;
-            botData.username = bot.username || mcUsername;
+            botData.username = bot.username;
             botData.online = true;
             console.log(`✅ [${botId}] ${botData.username} spawned on DonutSMP!`);
+            console.log(`   Position: ${bot.entity.position}`);
+            console.log(`   Health: ${bot.health}`);
+            
             startMessagingCycle(botData);
             resolve(botData);
+        });
+
+        bot.on('chat', (username, message) => {
+            if (username === bot.username) return;
+            console.log(`[${botId}] <${username}> ${message}`);
         });
 
         bot.on('error', (err) => {
@@ -98,7 +110,10 @@ function createBot(rawToken, botId) {
 
         bot.on('kicked', (reason) => {
             let msg = reason;
-            try { msg = JSON.parse(reason)?.text || reason; } catch {}
+            try {
+                const parsed = JSON.parse(reason);
+                msg = parsed.text || parsed.translate || reason;
+            } catch {}
             console.log(`⚠️ [${botId}] Kicked: ${msg}`);
             botData.online = false;
             if (!spawned) reject(new Error(`Kicked: ${msg}`));
@@ -108,21 +123,31 @@ function createBot(rawToken, botId) {
             console.log(`🔌 [${botId}] Disconnected: ${reason}`);
             botData.online = false;
             clearInterval(botData.messageInterval);
+            
+            // Auto-reconnect after 30 seconds
             botData.reconnectTimeout = setTimeout(async () => {
                 console.log(`🔄 [${botId}] Reconnecting...`);
                 try {
-                    const newBotData = await createBot(rawToken, botId);
-                    bots.set(botId, newBotData);
+                    const newData = await createBot(authString, botId);
+                    bots.set(botId, newData);
                 } catch (err) {
                     console.error(`[${botId}] Reconnect failed: ${err.message}`);
                 }
             }, 30000);
         });
 
+        bot.on('health', () => {
+            if (bot.health <= 0) {
+                console.log(`☠️ [${botId}] Died, respawning...`);
+                bot.chat('/spawn');
+            }
+        });
+
+        // Timeout if not spawned in 45 seconds
         setTimeout(() => {
             if (!spawned) {
                 try { bot.quit(); } catch {}
-                reject(new Error('Timed out after 45s - token may be expired'));
+                reject(new Error('Connection timeout - bot did not spawn in 45 seconds'));
             }
         }, 45000);
     });
@@ -130,13 +155,22 @@ function createBot(rawToken, botId) {
 
 function startMessagingCycle(botData) {
     clearInterval(botData.messageInterval);
+    
+    // Message every 8 seconds (avoids spam kick)
     botData.messageInterval = setInterval(() => {
-        if (!botData.online) return;
+        if (!botData.online || !botData.bot) return;
+        
+        const now = Date.now();
+        if (now - botData.lastMessage < 7000) return; // Rate limit
+        
+        // Check for force target
         const forceTarget = forceTargets.get('global');
         if (forceTarget) {
             sendMessage(botData, `/msg ${forceTarget} Hey! Check out DonutMarket for cheap items!`);
             return;
         }
+        
+        // Process queue
         if (botData.messageQueue.length > 0) {
             const target = botData.messageQueue.shift();
             sendMessage(botData, `/msg ${target} Hey! Check out DonutMarket for cheap items!`);
@@ -146,22 +180,45 @@ function startMessagingCycle(botData) {
 
 function sendMessage(botData, message) {
     try {
-        if (botData.bot && botData.online) botData.bot.chat(message);
+        if (botData.bot && botData.online) {
+            botData.bot.chat(message);
+            botData.lastMessage = Date.now();
+            console.log(`[${botData.id}] → ${message}`);
+        }
     } catch (err) {
         console.error(`[${botData.id}] Send failed: ${err.message}`);
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// API ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════
+
 app.post('/add', async (req, res) => {
     const { token, username } = req.body;
     const botId = username || `bot_${Date.now()}`;
-    if (!token) return res.status(400).json({ error: 'Token required' });
-    if (bots.has(botId)) return res.status(400).json({ error: 'Bot already exists' });
+    
+    if (!token) {
+        return res.status(400).json({ error: 'Token is required' });
+    }
+    
+    if (bots.has(botId)) {
+        return res.status(400).json({ error: `Bot ${botId} already exists` });
+    }
+    
+    console.log(`[API] Adding bot ${botId}...`);
+    
     try {
         const botData = await createBot(token, botId);
         bots.set(botId, botData);
-        res.json({ success: true, botId, mcUsername: botData.username });
+        res.json({ 
+            success: true, 
+            botId, 
+            mcUsername: botData.username,
+            message: `Bot ${botData.username} joined DonutSMP!`
+        });
     } catch (err) {
+        console.error(`[API] Failed to add bot:`, err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -169,44 +226,99 @@ app.post('/add', async (req, res) => {
 app.post('/remove', (req, res) => {
     const { username } = req.body;
     const botData = bots.get(username);
-    if (!botData) return res.status(404).json({ error: 'Not found' });
+    
+    if (!botData) {
+        return res.status(404).json({ error: `Bot ${username} not found` });
+    }
+    
     clearTimeout(botData.reconnectTimeout);
     clearInterval(botData.messageInterval);
-    try { botData.bot.quit(); } catch {}
+    try { botData.bot.quit('Removed by admin'); } catch {}
     bots.delete(username);
-    res.json({ success: true });
+    
+    res.json({ success: true, stopped: username });
 });
 
 app.post('/stopall', (req, res) => {
     let stopped = 0;
-    bots.forEach((b) => {
-        clearTimeout(b.reconnectTimeout);
-        clearInterval(b.messageInterval);
-        try { b.bot.quit(); } catch {}
+    bots.forEach((botData, botId) => {
+        clearTimeout(botData.reconnectTimeout);
+        clearInterval(botData.messageInterval);
+        try { botData.bot.quit('Stopped all bots'); } catch {}
         stopped++;
     });
     bots.clear();
     forceTargets.clear();
+    
     res.json({ success: true, stopped });
 });
 
 app.post('/forcemsg', (req, res) => {
     const { target } = req.body;
-    if (!target) return res.status(400).json({ error: 'Target required' });
+    
+    if (!target) {
+        return res.status(400).json({ error: 'Target player required' });
+    }
+    
     forceTargets.set('global', target);
-    res.json({ success: true, sent: bots.size });
+    console.log(`[API] Force messaging: ${target}`);
+    res.json({ success: true, sent: bots.size, target });
 });
 
 app.post('/stopforce', (req, res) => {
+    const stopped = bots.size;
     forceTargets.clear();
-    res.json({ success: true, stopped: bots.size });
+    res.json({ success: true, stopped });
+});
+
+app.post('/addqueue', (req, res) => {
+    const { targets } = req.body;
+    
+    if (!targets || !Array.isArray(targets)) {
+        return res.status(400).json({ error: 'targets array required' });
+    }
+    
+    let added = 0;
+    bots.forEach((botData) => {
+        targets.forEach(target => {
+            botData.messageQueue.push(target);
+            added++;
+        });
+    });
+    
+    res.json({ success: true, added });
 });
 
 app.get('/status', (req, res) => {
     const botList = [];
-    bots.forEach((b, id) => botList.push({ id, username: b.username, online: b.online }));
-    res.json({ online: botList.filter(b => b.online).length, total: bots.size, bots: botList });
+    bots.forEach((botData, botId) => {
+        botList.push({
+            id: botId,
+            username: botData.username,
+            online: botData.online,
+            queueLength: botData.messageQueue.length,
+            position: botData.bot?.entity?.position?.toString() || 'N/A'
+        });
+    });
+    
+    res.json({
+        online: botList.filter(b => b.online).length,
+        total: bots.size,
+        bots: botList,
+        forceTarget: forceTargets.get('global') || null
+    });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// START SERVER
+// ═══════════════════════════════════════════════════════════════════════════
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Bot API running | ${SERVER_HOST}:${SERVER_PORT} v${VERSION}`));
+app.listen(PORT, () => {
+    console.log(`╔════════════════════════════════════════╗`);
+    console.log(`║  🚀 DonutSMP Bot API                  ║`);
+    console.log(`║  📡 Port: ${PORT.toString().padEnd(28)} ║`);
+    console.log(`║  🎮 Server: ${SERVER_HOST.padEnd(23)} ║`);
+    console.log(`║  📦 Version: ${VERSION.padEnd(22)} ║`);
+    console.log(`╚════════════════════════════════════════╝`);
+});
