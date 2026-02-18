@@ -1,202 +1,109 @@
 const mineflayer = require('mineflayer');
-const express = require('express');
+const { Client, GatewayIntentBits } = require('discord.js');
 const { pathfinder } = require('mineflayer-pathfinder');
-const app = express();
-app.use(express.json());
+
+// --- VARIABLES FROM YOUR IMAGES ---
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const SERVER_HOST = 'DonutSMP.net'; // Hardcoded for your specific test
+const PREFIX = '!';
 
 const bots = new Map();
-const forceTargets = new Map();
 
-const SERVER_HOST = process.env.MC_HOST || 'DonutSMP.net';
-const SERVER_PORT = parseInt(process.env.MC_PORT || '25565');
-const VERSION = '1.21.5';
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
 
+// Helper: Extracts Username and UUID from the JWT Token
 function parseToken(jwtToken) {
     try {
         const payload = JSON.parse(Buffer.from(jwtToken.split('.')[1], 'base64').toString());
         const username = payload.pfd?.[0]?.name;
         const uuid = payload.pfd?.[0]?.id?.replace(/-/g, '');
-        return { username, uuid, token: jwtToken };
+        return { username, uuid };
     } catch (e) {
-        throw new Error('Invalid JWT token');
+        return null;
     }
 }
 
-function createBot(jwtToken, botId) {
-    return new Promise((resolve, reject) => {
-        const auth = parseToken(jwtToken);
-        const mcUsername = auth.username || `Bot_${botId}`;
-        const mcUuid = auth.uuid || '00000000000000000000000000000000';
-        
-        console.log(`[${botId}] Username: ${mcUsername}`);
-        console.log(`[${botId}] UUID: ${mcUuid}`);
-        console.log(`[${botId}] Connecting to ${SERVER_HOST}:${SERVER_PORT} v${VERSION}`);
+async function createBot(jwtToken, message) {
+    const auth = parseToken(jwtToken);
+    if (!auth) return message.reply("❌ Error: Invalid Token format.");
 
-        let spawned = false;
-        let bot;
+    if (bots.has(auth.username.toLowerCase())) {
+        return message.reply(`⚠️ **${auth.username}** is already online.`);
+    }
 
-        try {
-            bot = mineflayer.createBot({
-                host: SERVER_HOST,
-                port: SERVER_PORT,
-                version: VERSION,
-                username: mcUsername,
-                // CRITICAL: Pass the session directly - no interactive auth
-                session: {
-                    accessToken: jwtToken,
-                    clientToken: mcUuid,
-                    selectedProfile: {
-                        id: mcUuid,
-                        name: mcUsername
-                    }
-                },
-                auth: 'microsoft',
-                skipValidation: true, // Skip Microsoft validation
-                hideErrors: false,
-                checkTimeoutInterval: 60000,
-            });
-            
-            bot.loadPlugin(pathfinder);
-            
-        } catch (err) {
-            return reject(new Error(`Failed: ${err.message}`));
-        }
+    message.channel.send(`🔗 Connecting **${auth.username}** to DonutSMP...`);
 
-        const botData = {
-            bot, id: botId, token: jwtToken,
-            username: mcUsername, online: false,
-            messageQueue: [], messageInterval: null,
-            reconnectTimeout: null, lastMessage: 0
-        };
+    const bot = mineflayer.createBot({
+        host: SERVER_HOST,
+        port: 25565,
+        version: false, // Auto-detect version for 1.21+
+        username: auth.username,
+        session: {
+            accessToken: jwtToken,
+            clientToken: auth.uuid,
+            selectedProfile: { id: auth.uuid, name: auth.username }
+        },
+        auth: 'microsoft',
+        skipValidation: true
+    });
 
-        bot.once('spawn', () => {
-            spawned = true;
-            botData.username = bot.username;
-            botData.online = true;
-            console.log(`✅ [${botId}] ${botData.username} joined!`);
-            startMessagingCycle(botData);
-            resolve(botData);
-        });
+    bot.loadPlugin(pathfinder);
 
-        bot.on('error', (err) => {
-            console.error(`❌ [${botId}] ${err.message}`);
-            botData.online = false;
-            if (!spawned) reject(err);
-        });
+    bot.once('spawn', () => {
+        bots.set(auth.username.toLowerCase(), bot);
+        message.channel.send(`✅ **${auth.username}** has joined the server!`);
+    });
 
-        bot.on('kicked', (reason) => {
-            let msg = reason;
-            try { msg = JSON.parse(reason)?.text || reason; } catch {}
-            console.log(`⚠️ [${botId}] Kicked: ${msg}`);
-            botData.online = false;
-            if (!spawned) reject(new Error(`Kicked: ${msg}`));
-        });
+    bot.on('error', (err) => message.channel.send(`❌ [${auth.username}] Error: ${err.message}`));
+    
+    bot.on('kicked', (reason) => {
+        const cleanReason = reason.replace(/§./g, ''); // Remove color codes
+        message.channel.send(`⚠️ [${auth.username}] Kicked: ${cleanReason}`);
+    });
 
-        bot.on('end', (reason) => {
-            console.log(`🔌 [${botId}] Disconnected`);
-            botData.online = false;
-            clearInterval(botData.messageInterval);
-            botData.reconnectTimeout = setTimeout(async () => {
-                try {
-                    const newData = await createBot(jwtToken, botId);
-                    bots.set(botId, newData);
-                } catch (err) {
-                    console.error(`[${botId}] Reconnect failed: ${err.message}`);
-                }
-            }, 30000);
-        });
-
-        setTimeout(() => {
-            if (!spawned) {
-                try { bot.quit(); } catch {}
-                reject(new Error('Timeout'));
-            }
-        }, 60000);
+    bot.on('end', () => {
+        bots.delete(auth.username.toLowerCase());
+        message.channel.send(`🔌 **${auth.username}** disconnected.`);
     });
 }
 
-function startMessagingCycle(botData) {
-    clearInterval(botData.messageInterval);
-    botData.messageInterval = setInterval(() => {
-        if (!botData.online) return;
-        if (Date.now() - botData.lastMessage < 7000) return;
-        
-        const forceTarget = forceTargets.get('global');
-        if (forceTarget) {
-            sendMessage(botData, `/msg ${forceTarget} DonutMarket has cheap items!`);
-            return;
-        }
-        
-        if (botData.messageQueue.length > 0) {
-            const target = botData.messageQueue.shift();
-            sendMessage(botData, `/msg ${target} DonutMarket has cheap items!`);
-        }
-    }, 8000);
-}
+// --- DISCORD COMMANDS ---
+client.on('messageCreate', async (message) => {
+    if (message.author.bot || !message.content.startsWith(PREFIX)) return;
 
-function sendMessage(botData, message) {
-    try {
-        if (botData.bot && botData.online) {
-            botData.bot.chat(message);
-            botData.lastMessage = Date.now();
-        }
-    } catch {}
-}
+    const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+    const command = args.shift().toLowerCase();
 
-app.post('/add', async (req, res) => {
-    const { token, username } = req.body;
-    const botId = username || `bot_${Date.now()}`;
-    if (!token) return res.status(400).json({ error: 'Token required' });
-    if (bots.has(botId)) return res.status(400).json({ error: 'Bot exists' });
-    try {
-        const botData = await createBot(token, botId);
-        bots.set(botId, botData);
-        res.json({ success: true, botId, mcUsername: botData.username });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+    // !add <token>
+    if (command === 'add') {
+        const token = args[0];
+        if (!token) return message.reply("Usage: `!add <token>`");
+        createBot(token, message);
+    }
+
+    // !cmd <botname> <command>
+    if (command === 'cmd') {
+        const targetBot = args[0]?.toLowerCase();
+        const mcAction = args.slice(1).join(' ');
+
+        if (!targetBot || !mcAction) return message.reply("Usage: `!cmd <bot_username> <command>`");
+
+        const bot = bots.get(targetBot);
+        if (bot) {
+            bot.chat(mcAction);
+            message.react('✔️');
+        } else {
+            message.reply(`❌ Bot **${targetBot}** is not connected.`);
+        }
     }
 });
 
-app.post('/remove', (req, res) => {
-    const b = bots.get(req.body.username);
-    if (!b) return res.status(404).json({ error: 'Not found' });
-    clearTimeout(b.reconnectTimeout);
-    clearInterval(b.messageInterval);
-    try { b.bot.quit(); } catch {}
-    bots.delete(req.body.username);
-    res.json({ success: true });
-});
-
-app.post('/stopall', (req, res) => {
-    let stopped = 0;
-    bots.forEach((b) => {
-        clearTimeout(b.reconnectTimeout);
-        clearInterval(b.messageInterval);
-        try { b.bot.quit(); } catch {}
-        stopped++;
-    });
-    bots.clear();
-    forceTargets.clear();
-    res.json({ success: true, stopped });
-});
-
-app.post('/forcemsg', (req, res) => {
-    const { target } = req.body;
-    if (!target) return res.status(400).json({ error: 'Target required' });
-    forceTargets.set('global', target);
-    res.json({ success: true, sent: bots.size });
-});
-
-app.post('/stopforce', (req, res) => {
-    forceTargets.clear();
-    res.json({ success: true });
-});
-
-app.get('/status', (req, res) => {
-    const botList = [];
-    bots.forEach((b, id) => botList.push({ id, username: b.username, online: b.online }));
-    res.json({ online: botList.filter(b => b.online).length, total: bots.size, bots: botList });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Bot API on ${PORT} | ${SERVER_HOST} v${VERSION}`));
+client.login(DISCORD_TOKEN);
+console.log("Discord Bot is starting...");
