@@ -2,9 +2,9 @@
   "name": "donutsmp-minecraft-bot",
   "version": "1.0.0",
   "description": "Minecraft bots for DonutSMP",
-  "main": "minecraft-bot.js",
+  "main": "bot.js",
   "scripts": {
-    "start": "node minecraft-bot.js"
+    "start": "node bot.js"
   },
   "dependencies": {
     "mineflayer": "^4.33.0",
